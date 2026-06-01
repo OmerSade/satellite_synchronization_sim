@@ -1,0 +1,75 @@
+{
+  "simulation": {
+    "name": "isdts_laser_rf_demo",
+    "seed": 42,
+    "satellite_count": 24,
+    "steps": 120,
+    "time_step_s": 1.0,
+    "convergence_threshold_ns": 1.0,
+    "initial_offset_std_ns": 80.0,
+    "initial_drift_std_ns_per_s": 0.08,
+    "distributed_gain": 0.65,
+    "laser_weight": 0.75,
+    "rf_weight": 0.25,
+    "crosslink_probability": 0.08,
+    "link_dropout_probability": 0.01,
+    "faulty_nodes": [],
+    "failure_events": []
+  },
+  "geometry": {
+    "base_range_m": 800000.0,
+    "range_jitter_m": 90000.0,
+    "elevation_deg": 60.0,
+    "pointing_error_rad": 8e-7,
+    "zenith_transmittance": 0.9,
+    "relative_velocity_std_m_per_s": 180.0
+  },
+  "laser": {
+    "wavelength_m": 1.55e-6,
+    "transmit_power_w": 2.0,
+    "transmitter_aperture_m": 0.08,
+    "receiver_aperture_m": 0.4,
+    "optical_efficiency": 0.65,
+    "data_rate_bps": 1000000000.0,
+    "receiver_bandwidth_hz": 1000000000.0,
+    "detector_quantum_efficiency": 0.75,
+    "detector_noise_w": 2e-12,
+    "background_power_w": 5e-10,
+    "implementation_loss_db": 2.0,
+    "acquisition_snr_threshold_db": 3.0,
+    "timing_jitter_floor_s": 2.5e-11
+  },
+  "rf": {
+    "carrier_frequency_hz": 2200000000.0,
+    "sample_rate_hz": 1000000.0,
+    "symbol_rate_hz": 250000.0,
+    "transmit_power_dbw": 8.0,
+    "transmitter_gain_dbi": 24.0,
+    "receiver_gain_dbi": 32.0,
+    "system_loss_db": 2.0,
+    "receiver_noise_figure_db": 3.0,
+    "antenna_temperature_k": 290.0,
+    "implementation_loss_db": 1.0,
+    "sync_threshold_db": 6.0,
+    "timestamp_jitter_std_s": 2.5e-9,
+    "phase_noise_std_rad": 0.01,
+    "frame_symbols": 512
+  },
+  "monte_carlo": {
+    "enabled": false,
+    "runs": 20,
+    "seed": 2025,
+    "vary": {
+      "simulation.initial_offset_std_ns": {"distribution": "uniform", "low": 40.0, "high": 150.0},
+      "simulation.initial_drift_std_ns_per_s": {"distribution": "uniform", "low": 0.02, "high": 0.2},
+      "simulation.link_dropout_probability": {"distribution": "uniform", "low": 0.0, "high": 0.05},
+      "geometry.range_jitter_m": {"distribution": "normal", "mean": 90000.0, "std": 20000.0, "min": 10000.0},
+      "geometry.pointing_error_rad": {"distribution": "loguniform", "low": 2e-7, "high": 2e-6}
+    }
+  },
+  "outputs": {
+    "root": "outputs",
+    "save_csv": true,
+    "save_plots": true
+  }
+}
