@@ -1,117 +1,138 @@
 # Satellite Synchronization Simulation
 
-This repository contains a clean Python simulation framework for comparing an
-inter-satellite distributed time synchronization (IS-DTS) algorithm with a simple
-Precision Time Protocol (PTP)-like baseline in a LEO satellite network.
+Educational Python simulation for distributed time synchronization in a low Earth
+orbit (LEO) satellite mesh. The simulator compares nanosecond-scale consensus
+behavior across inter-satellite optical and RF timestamp exchanges, records run
+metrics, and can repeat the experiment with Monte Carlo parameter draws.
 
 The model is inspired by Han et al., **"Inter-satellite distributed time
 synchronization solution with nanosecond accuracy in satellite networks"**,
-*Optics Express* 33(7), 14555-14565 (2025), DOI: `10.1364/OE.543159`. The paper
-proposes distributed, parallel inter-satellite time exchange to reduce the impact
-of dynamic link latency and demonstrates robustness under topology changes and
-node failures. This project implements a compact educational simulation rather
-than a bit-accurate reproduction of the paper.
+*Optics Express* 33(7), 14555-14565 (2025), DOI: `10.1364/OE.543159`. This
+repository is a compact educational implementation rather than a bit-accurate
+reproduction of the paper.
 
-## Project structure
+## Repository layout
 
 ```text
-src/
-  satellite.py        # Satellite node state and clock model
-  network.py          # Graph topology and asymmetric link-delay model
-  isdts.py            # Distributed parallel IS-DTS-style algorithm
-  ptp.py              # Simplified serial master-slave PTP baseline
-  simulation.py       # Main comparison simulation loop
-utils/
-  metrics.py          # Error and convergence metrics
-  plotting.py         # Matplotlib visualization helpers
-experiments/
-  run_simulation.py   # Command-line experiment runner
-requirements.txt
-README.md
+simulation.py                     # Main CLI, satellite clock model, topology, metrics, outputs
+satellite_laser_communication.py  # Optical link budget, acquisition, timing-noise model
+satellite_receiver.py             # RF link budget, frame reception, BER/timestamp model
+plots.py                          # Matplotlib plots for regular and Monte Carlo runs
+parameters                        # JSON configuration used by default
+requirements.txt                  # Runtime Python dependencies
+outputs/                          # Generated run folders (created at runtime, git-ignored)
 ```
 
-## Simulation model
+> Note: `simulation.py` installs a small compatibility module named
+> `src.satellite` at runtime because the standalone RF and laser communication
+> modules import `Satellite` and `SatelliteState` through that legacy path.
 
-- The network contains a configurable number of satellites, defaulting to 72.
-- Each satellite has:
-  - a local clock offset in nanoseconds,
-  - a small oscillator drift in nanoseconds per second,
-  - an operational state: `Initializing`, `Listening`, `Adjusting`, or `Faulty`.
-- The topology is a graph-based LEO-like mesh, not a full orbital propagator.
-  Ring links model nearby same-plane neighbors, and random cross-links approximate
-  inter-plane optical links.
-- Time advances in discrete simulation steps.
-- Optional link toggling and node-failure events can be enabled from the CLI.
+## What the simulation models
 
-## IS-DTS-style algorithm
+- A configurable constellation size (`simulation.satellite_count`) with a
+  ring-plus-random-crosslink topology.
+- Per-satellite clock offset and drift in nanoseconds.
+- Healthy and faulty satellite states, including optional failure events during a
+  run.
+- Parallel neighbor exchanges on active links each synchronization round.
+- Link dropout probability to emulate unavailable inter-satellite links.
+- Weighted corrections from two measurement channels:
+  - laser optical downlink measurements, controlled by `laser_weight`, and
+  - RF frame timing measurements, controlled by `rf_weight`.
+- Consensus-style clock correction using `distributed_gain`.
 
-The IS-DTS implementation is distributed and parallel:
+## Configuration
 
-1. All healthy satellites exchange timestamp information with active neighbors in
-   the same simulation step.
-2. Each active link generates a pairwise offset estimate between neighboring
-   clocks. Residual measurement error includes timestamp noise and directed-delay
-   asymmetry.
-3. Each satellite averages offset estimates from healthy neighbors.
-4. The local clock is corrected toward that neighborhood average.
-5. Faulty satellites are ignored by healthy nodes.
+All tunable values live in the root-level `parameters` JSON file. Important
+sections are:
 
-This produces a consensus-like synchronization process with no permanent master
-node.
+- `simulation`: constellation size, number of steps, random seed, clock-error
+  distributions, correction gains, dropout probability, faulty nodes, and failure
+  events.
+- `geometry`: nominal link range, range jitter, elevation, pointing error,
+  atmospheric transmittance, and relative velocity spread.
+- `laser`: optical wavelength, power, aperture sizes, detector/background noise,
+  acquisition threshold, and timing jitter floor.
+- `rf`: carrier frequency, sample/symbol rates, power/gains/losses, noise model,
+  synchronization threshold, phase noise, and frame size.
+- `monte_carlo`: optional repeated-run settings and parameter distributions.
+- `outputs`: output root directory and plot generation toggle.
 
-## Baseline PTP-like algorithm
+To try a custom configuration, copy `parameters`, edit the copy, and pass it to
+the CLI with `--parameters`.
 
-The baseline uses a serial master-slave approach:
+## Outputs
 
-1. Satellite `0` acts as the master clock.
-2. Each healthy non-master satellite estimates its offset to the master.
-3. The estimate assumes symmetric propagation delay.
-4. Directed link-delay asymmetry leaves a residual bias, demonstrating why serial
-   timestamp exchange can be less accurate in dynamic satellite networks.
+Each run creates a timestamped folder under `outputs/` by default. A regular run
+contains:
 
-## Metrics and plots
+- `parameters.json`: exact configuration snapshot used for the run.
+- `metrics.csv`: per-step peak-to-peak error, RMS error, mean laser SNR, mean RF
+  Eb/No, and accepted measurement count.
+- `clock_offsets.csv`: per-step offset for every satellite.
+- `summary.json`: final RMS error, final peak-to-peak error, convergence step,
+  and accepted-measurement total.
+- `error_evolution.png`, `clock_offsets.png`, and `link_quality.png` when plots
+  are enabled.
 
-The experiment records:
-
-- peak-to-peak time difference across healthy satellites,
-- RMS error after subtracting the healthy-node mean,
-- time to convergence below a configurable threshold.
-
-The default runner writes a comparison plot to `outputs/error_comparison.png`.
+A Monte Carlo run creates one parent output folder with one `draw_XXX/` child
+folder per draw, plus `monte_carlo_summary.json` and aggregate Monte Carlo plots.
 
 ## Quick start
+
+The project requires Python 3.10 or newer because it uses modern type-hint
+syntax such as `str | Path`.
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-python experiments/run_simulation.py
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+python simulation.py
 ```
 
-Run without generating a plot:
+Run a single simulation even if the parameter file enables Monte Carlo mode:
 
 ```bash
-python experiments/run_simulation.py --no-plots
+python simulation.py --single-run
 ```
 
-Example with topology changes and a node failure:
+Run Monte Carlo mode from the existing parameter file:
 
 ```bash
-python experiments/run_simulation.py \
-  --nodes 72 \
-  --steps 150 \
-  --link-toggle-probability 0.03 \
-  --fail-node 50:12
+python simulation.py --monte-carlo
 ```
 
-## Notes and next steps
+Run with a custom parameter file:
 
-This first version focuses on the core project structure and a working simulation.
-Useful extensions include:
+```bash
+python simulation.py --parameters path/to/parameters.json
+```
 
-- replacing the graph mesh with orbital-plane geometry and polar-region link
-  rules,
-- adding hardware timestamp quantization and clock-noise models,
-- implementing weighted neighbor selection based on link quality,
-- exporting metrics to CSV for batch experiments,
-- adding unit tests for convergence and fault handling.
+Disable plot generation by setting `outputs.save_plots` to `false` in the
+parameter file. CSV and JSON summaries are still written for downstream analysis.
+
+## Generated metrics
+
+The main convergence metrics are:
+
+- **Peak-to-peak error**: max minus min clock offset across healthy satellites.
+- **RMS error**: RMS of healthy-satellite offsets after subtracting the healthy
+  mean offset.
+- **Convergence step**: first step where RMS error is at or below
+  `simulation.convergence_threshold_ns`; `null` means the run did not converge
+  within the configured step count.
+- **Accepted measurements**: number of laser/RF measurements that passed their
+  acquisition or synchronization thresholds in a step.
+
+## Development notes
+
+- The repository is intentionally lightweight and does not currently include a
+  package build system or automated test suite.
+- `requirements.txt` lists only third-party runtime dependencies; the remaining
+  imports are from the Python standard library.
+- Generated output folders can become large during Monte Carlo runs and should
+  remain untracked.
+- Useful next improvements include unit tests for convergence/failure handling,
+  optional CSV gating via `outputs.save_csv`, richer orbital-plane geometry, and
+  batch-analysis notebooks.
