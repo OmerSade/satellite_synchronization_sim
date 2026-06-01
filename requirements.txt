@@ -1,2 +1,4 @@
+# Runtime dependencies for the satellite synchronization simulator.
+# Python 3.10+ is required by the source code type-hint syntax.
 numpy>=1.24
 matplotlib>=3.7
