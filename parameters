@@ -71,5 +71,49 @@
     "root": "outputs",
     "save_csv": true,
     "save_plots": true
+  },
+  "is_dts_simulation": {
+    "description": "Paper-aligned IS-DTS DES parameters for the LEO Walker constellation.",
+    "satellite_count": 72,
+    "orbital_planes": 6,
+    "satellites_per_plane": 12,
+    "altitude_m": 1000000,
+    "inclination_deg": 99.5,
+    "polar_disconnect_latitude_deg": 66.5,
+    "des_time_step_s": 0.02,
+    "time_adjustment_interval_s": 0.4,
+    "duration_s": 200.0,
+    "convergence_threshold_ns": 2.5,
+    "max_initial_time_offset_s": 1.0,
+    "oscillator_frequency_accuracy": 1e-8,
+    "timing_difference_sending_messages_s": 1e-6,
+    "same_plane_neighbors": 2,
+    "cross_plane_neighbors": 2,
+    "opposite_direction_plane_links": false,
+    "polar_cross_plane_disconnect": true,
+    "adjustment_interval_scenarios": [0.2, 0.4, 0.8],
+    "failure_scenarios": [
+      {
+        "orbital_plane": 3,
+        "satellite_index": 1,
+        "failure_start_s": 40,
+        "failure_duration_s": 100
+      },
+      {
+        "orbital_plane": 6,
+        "satellite_index": 12,
+        "failure_start_s": 90,
+        "failure_duration_s": 100
+      }
+    ],
+    "expected_results": {
+      "baseline_convergence_time_s": [120, 150],
+      "baseline_peak_to_peak_time_difference_ns": 2.1,
+      "adjustment_interval_convergence_times_s": {"0.2": 60, "0.4": 150, "0.8": 180},
+      "traditional_ptp_same_plane_peak_to_peak_ns": 23.01,
+      "traditional_ptp_different_plane_time_difference_s": 2.15e-6,
+      "polar_topology_accuracy_ns": [2.1, 2.4],
+      "node_failure_accuracy_ns": 2.5
+    }
   }
 }

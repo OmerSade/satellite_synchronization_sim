@@ -45,6 +45,8 @@ class Satellite:
     node_id: int
     offset_ns: float
     drift_ns_per_s: float
+    orbital_plane: int = 0
+    satellite_index: int = 0
     state: SatelliteState = SatelliteState.INITIALIZING
 
     def complete_initialization(self) -> None:
@@ -141,34 +143,242 @@ def sample_monte_carlo_value(spec: dict[str, Any], rng: np.random.Generator) -> 
     return float(value)
 
 
+def time_sync_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return IS-DTS settings, falling back to legacy ``simulation`` keys.
+
+    The ``is_dts_simulation`` section contains the paper-derived Walker
+    constellation, DES, topology, and scenario parameters.  Legacy simulations
+    that only define ``simulation`` continue to run with their existing values.
+    """
+
+    return config.get("is_dts_simulation", config["simulation"])
+
+
+def simulation_time_step_s(config: dict[str, Any]) -> float:
+    sync = time_sync_config(config)
+    return float(sync.get("des_time_step_s", config["simulation"].get("time_step_s", 1.0)))
+
+
+def adjustment_interval_s(config: dict[str, Any]) -> float:
+    sync = time_sync_config(config)
+    return float(sync.get("time_adjustment_interval_s", simulation_time_step_s(config)))
+
+
+def simulation_duration_s(config: dict[str, Any]) -> float:
+    sync = time_sync_config(config)
+    sim = config["simulation"]
+    if "duration_s" in sync:
+        return float(sync["duration_s"])
+    return int(sim.get("steps", 1)) * simulation_time_step_s(config)
+
+
+def simulation_step_count(config: dict[str, Any]) -> int:
+    sync = time_sync_config(config)
+    if "steps" in sync:
+        return int(sync["steps"])
+    return max(1, int(round(simulation_duration_s(config) / simulation_time_step_s(config))))
+
+
+def paper_satellite_count(config: dict[str, Any]) -> int:
+    sync = time_sync_config(config)
+    return int(sync.get("satellite_count", config["simulation"].get("satellite_count", 1)))
+
+
 def create_satellites(config: dict[str, Any], rng: np.random.Generator) -> list[Satellite]:
     sim = config["simulation"]
-    satellites = [
-        Satellite(
-            node_id=index,
-            offset_ns=float(rng.normal(0.0, sim["initial_offset_std_ns"])),
-            drift_ns_per_s=float(rng.normal(0.0, sim["initial_drift_std_ns_per_s"])),
+    sync = time_sync_config(config)
+    count = paper_satellite_count(config)
+    planes = int(sync.get("orbital_planes", 1))
+    satellites_per_plane = int(sync.get("satellites_per_plane", max(1, count // max(planes, 1))))
+
+    max_initial_offset_s = sync.get("max_initial_time_offset_s")
+    oscillator_accuracy = sync.get("oscillator_frequency_accuracy")
+    satellites: list[Satellite] = []
+    for node_id in range(count):
+        if max_initial_offset_s is None:
+            offset_ns = float(rng.normal(0.0, sim.get("initial_offset_std_ns", 0.0)))
+        else:
+            # Paper parameter: initial satellite clock offsets are uniformly
+            # distributed within ±1 s for the IS-DTS DES experiments.
+            offset_ns = float(
+                rng.uniform(-float(max_initial_offset_s), float(max_initial_offset_s)) * 1e9
+            )
+
+        if oscillator_accuracy is None:
+            drift_ns_per_s = float(rng.normal(0.0, sim.get("initial_drift_std_ns_per_s", 0.0)))
+        else:
+            # Fractional oscillator frequency accuracy maps directly to clock
+            # drift in seconds per second; store as ns/s for the local model.
+            drift_ns_per_s = float(
+                rng.uniform(-float(oscillator_accuracy), float(oscillator_accuracy)) * 1e9
+            )
+
+        satellites.append(
+            Satellite(
+                node_id=node_id,
+                offset_ns=offset_ns,
+                drift_ns_per_s=drift_ns_per_s,
+                orbital_plane=node_id // satellites_per_plane,
+                satellite_index=node_id % satellites_per_plane,
+            )
         )
-        for index in range(int(sim["satellite_count"]))
-    ]
+
     for node_id in sim.get("faulty_nodes", []):
         satellites[int(node_id)].state = SatelliteState.FAULTY
     return satellites
 
 
-def build_topology(config: dict[str, Any], rng: np.random.Generator) -> list[tuple[int, int]]:
-    """Build a ring-plus-crosslink LEO-style topology for parallel exchanges."""
+def _walker_node_id(plane: int, sat_index: int, satellites_per_plane: int) -> int:
+    return plane * satellites_per_plane + sat_index
+
+
+def build_walker_mesh_topology(config: dict[str, Any]) -> list[tuple[int, int, str]]:
+    """Build the deterministic paper-style Walker mesh ISL topology.
+
+    Each satellite has two same-plane neighbors and two cross-plane neighbors in
+    neighboring planes moving in the same direction.  Inter-plane polar-region
+    disconnections are applied dynamically during the simulation.
+    """
+
+    sync = time_sync_config(config)
+    planes = int(sync["orbital_planes"])
+    satellites_per_plane = int(sync["satellites_per_plane"])
+    edges: set[tuple[int, int, str]] = set()
+
+    for plane in range(planes):
+        for sat_index in range(satellites_per_plane):
+            node_id = _walker_node_id(plane, sat_index, satellites_per_plane)
+            ahead = _walker_node_id(
+                plane, (sat_index + 1) % satellites_per_plane, satellites_per_plane
+            )
+            edges.add((min(node_id, ahead), max(node_id, ahead), "same_plane"))
+
+            if int(sync.get("cross_plane_neighbors", 2)) > 0:
+                for neighbor_plane in ((plane - 1) % planes, (plane + 1) % planes):
+                    # The paper excludes opposite-direction orbital-plane ISLs.
+                    # This Walker-like educational model treats adjacent planes
+                    # as same-direction and keeps the legacy random topology out
+                    # of the paper-based IS-DTS path.
+                    other = _walker_node_id(neighbor_plane, sat_index, satellites_per_plane)
+                    edges.add((min(node_id, other), max(node_id, other), "cross_plane"))
+
+    return sorted(edges)
+
+
+def build_legacy_topology(config: dict[str, Any], rng: np.random.Generator) -> list[tuple[int, int, str]]:
+    """Build the previous ring-plus-random-crosslink topology for legacy configs."""
 
     sim = config["simulation"]
     count = int(sim["satellite_count"])
-    edges = {(index, (index + 1) % count) for index in range(count)}
+    edges: set[tuple[int, int, str]] = {
+        (min(index, (index + 1) % count), max(index, (index + 1) % count), "same_plane")
+        for index in range(count)
+    }
     for index in range(count):
         for other in range(index + 2, count):
             if other == (index - 1) % count:
                 continue
-            if rng.random() < float(sim["crosslink_probability"]):
-                edges.add((index, other))
-    return sorted((min(a, b), max(a, b)) for a, b in edges)
+            if rng.random() < float(sim.get("crosslink_probability", 0.0)):
+                edges.add((index, other, "cross_plane"))
+    return sorted(edges)
+
+
+def build_topology(config: dict[str, Any], rng: np.random.Generator) -> list[tuple[int, int, str]]:
+    """Build IS-DTS topology, preferring deterministic paper Walker mesh settings."""
+
+    sync = time_sync_config(config)
+    if {"orbital_planes", "satellites_per_plane"}.issubset(sync):
+        return build_walker_mesh_topology(config)
+    return build_legacy_topology(config, rng)
+
+
+def satellite_latitude_deg(satellite: Satellite, true_time_s: float, config: dict[str, Any]) -> float:
+    """Approximate Walker-orbit latitude for polar ISL gating.
+
+    This compact DES model uses one sinusoidal orbit phase per satellite; it is
+    sufficient to apply the paper's latitude > 66.5° inter-plane disconnection
+    rule without introducing a full orbit propagator.
+    """
+
+    sync = time_sync_config(config)
+    satellites_per_plane = int(sync.get("satellites_per_plane", max(1, paper_satellite_count(config))))
+    inclination_deg = float(sync.get("inclination_deg", 90.0))
+    orbital_period_s = float(sync.get("orbital_period_s", 6307.0))
+    phase = 2.0 * np.pi * (
+        satellite.satellite_index / satellites_per_plane + true_time_s / orbital_period_s
+    )
+    return float(inclination_deg * np.sin(phase))
+
+
+def is_edge_active(
+    left: int,
+    right: int,
+    edge_type: str,
+    satellites: list[Satellite],
+    true_time_s: float,
+    config: dict[str, Any],
+) -> bool:
+    """Return whether an ISL is active after health and polar-region checks."""
+
+    sat_left = satellites[left]
+    sat_right = satellites[right]
+    if not sat_left.is_healthy or not sat_right.is_healthy:
+        return False
+
+    sync = time_sync_config(config)
+    if edge_type == "cross_plane" and bool(sync.get("polar_cross_plane_disconnect", False)):
+        threshold = float(sync.get("polar_disconnect_latitude_deg", 90.0))
+        if (
+            abs(satellite_latitude_deg(sat_left, true_time_s, config)) > threshold
+            or abs(satellite_latitude_deg(sat_right, true_time_s, config)) > threshold
+        ):
+            return False
+    return True
+
+
+def paper_failure_node_id(event: dict[str, Any], config: dict[str, Any]) -> int:
+    """Translate paper scenario plane/satellite numbering to zero-based node id."""
+
+    if "node_id" in event:
+        return int(event["node_id"])
+    sync = time_sync_config(config)
+    satellites_per_plane = int(sync.get("satellites_per_plane", 1))
+    return _walker_node_id(
+        int(event["orbital_plane"]) - 1,
+        int(event["satellite_index"]) - 1,
+        satellites_per_plane,
+    )
+
+
+def update_satellite_failures(
+    satellites: list[Satellite], config: dict[str, Any], true_time_s: float, step: int
+) -> None:
+    """Apply legacy step failures and paper time-window node failures."""
+
+    sim = config["simulation"]
+    permanently_faulty = {int(node_id) for node_id in sim.get("faulty_nodes", [])}
+    active_failures: set[int] = set(permanently_faulty)
+
+    for event in sim.get("failure_events", []):
+        if "step" in event and int(event.get("step", -1)) == step:
+            active_failures.add(int(event["node_id"]))
+        elif "failure_start_s" in event:
+            start_s = float(event["failure_start_s"])
+            duration_s = float(event.get("failure_duration_s", 0.0))
+            if start_s <= true_time_s < start_s + duration_s:
+                active_failures.add(paper_failure_node_id(event, config))
+
+    for event in time_sync_config(config).get("failure_scenarios", []):
+        start_s = float(event["failure_start_s"])
+        duration_s = float(event["failure_duration_s"])
+        if start_s <= true_time_s < start_s + duration_s:
+            active_failures.add(paper_failure_node_id(event, config))
+
+    for satellite in satellites:
+        if satellite.node_id in active_failures:
+            satellite.state = SatelliteState.FAULTY
+        elif satellite.state == SatelliteState.FAULTY:
+            satellite.state = SatelliteState.LISTENING
 
 
 def make_laser_config(config: dict[str, Any]) -> LaserLinkConfig:
@@ -209,6 +419,11 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
     write_parameters(config, run_dir / "parameters.json")
 
     sim = config["simulation"]
+    sync = time_sync_config(config)
+    dt_s = simulation_time_step_s(config)
+    adjust_interval_s = adjustment_interval_s(config)
+    adjust_every_steps = max(1, int(round(adjust_interval_s / dt_s)))
+    total_steps = simulation_step_count(config)
     rng = np.random.default_rng(int(sim["seed"]))
     satellites = create_satellites(config, rng)
     edges = build_topology(config, rng)
@@ -223,46 +438,56 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
         "mean_laser_snr_db": [],
         "mean_rf_ebno_db": [],
         "active_measurements": [],
+        "per_orbital_plane_time_difference_ns": [],
     }
 
-    for step in range(int(sim["steps"])):
-        true_time_s = step * float(sim["time_step_s"])
-        apply_failure_events(satellites, sim.get("failure_events", []), step)
+    for step in range(total_steps):
+        true_time_s = step * dt_s
+        update_satellite_failures(satellites, config, true_time_s, step)
         for satellite in satellites:
-            satellite.tick(float(sim["time_step_s"]))
+            satellite.tick(dt_s)
 
         corrections: dict[int, list[float]] = {sat.node_id: [] for sat in satellites if sat.is_healthy}
         laser_snr_values: list[float] = []
         rf_ebno_values: list[float] = []
         accepted_measurements = 0
 
-        for left, right in edges:
-            if rng.random() < float(sim["link_dropout_probability"]):
-                continue
-            sat_left = satellites[left]
-            sat_right = satellites[right]
-            if not sat_left.is_healthy or not sat_right.is_healthy:
-                continue
+        if step % adjust_every_steps == 0:
+            for left, right, edge_type in edges:
+                if rng.random() < float(sim.get("link_dropout_probability", 0.0)):
+                    continue
+                if not is_edge_active(left, right, edge_type, satellites, true_time_s, config):
+                    continue
+                sat_left = satellites[left]
+                sat_right = satellites[right]
 
-            laser_geometry, rf_geometry = link_geometry(config, rng)
+                laser_geometry, rf_geometry = link_geometry(config, rng)
 
-            laser_receiver = SatelliteLaserCommunication(
-                receiver=sat_right, config=laser_config, rng=rng
-            )
-            laser_measurement = laser_receiver.measure_downlink(sat_left, true_time_s, laser_geometry)
-            laser_snr_values.append(laser_measurement.snr_db)
-            if laser_measurement.acquired:
-                corrections[right].append(
-                    -float(sim["laser_weight"]) * laser_measurement.estimated_offset_ns
+                send_timing_noise_ns = (
+                    float(sync.get("timing_difference_sending_messages_s", 0.0)) * 1e9
                 )
-                accepted_measurements += 1
 
-            rf_receiver = SatelliteRFReceiver(receiver=sat_left, config=rf_config, rng=rng)
-            rf_measurement = rf_receiver.receive_time_frame(sat_right, true_time_s, rf_geometry)
-            rf_ebno_values.append(rf_measurement.ebno_db)
-            if rf_measurement.synchronized:
-                corrections[left].append(-float(sim["rf_weight"]) * rf_measurement.estimated_offset_ns)
-                accepted_measurements += 1
+                laser_receiver = SatelliteLaserCommunication(
+                    receiver=sat_right, config=laser_config, rng=rng
+                )
+                laser_measurement = laser_receiver.measure_downlink(sat_left, true_time_s, laser_geometry)
+                laser_snr_values.append(laser_measurement.snr_db)
+                if laser_measurement.acquired:
+                    estimated_offset_ns = laser_measurement.estimated_offset_ns
+                    if send_timing_noise_ns:
+                        estimated_offset_ns += float(rng.uniform(-send_timing_noise_ns, send_timing_noise_ns))
+                    corrections[right].append(-float(sim["laser_weight"]) * estimated_offset_ns)
+                    accepted_measurements += 1
+
+                rf_receiver = SatelliteRFReceiver(receiver=sat_left, config=rf_config, rng=rng)
+                rf_measurement = rf_receiver.receive_time_frame(sat_right, true_time_s, rf_geometry)
+                rf_ebno_values.append(rf_measurement.ebno_db)
+                if rf_measurement.synchronized:
+                    estimated_offset_ns = rf_measurement.estimated_offset_ns
+                    if send_timing_noise_ns:
+                        estimated_offset_ns += float(rng.uniform(-send_timing_noise_ns, send_timing_noise_ns))
+                    corrections[left].append(-float(sim["rf_weight"]) * estimated_offset_ns)
+                    accepted_measurements += 1
 
         for node_id, node_corrections in corrections.items():
             if node_corrections:
@@ -280,7 +505,17 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
         history["rms_error_ns"].append(float(np.sqrt(np.mean(centered**2))))
         history["mean_laser_snr_db"].append(float(np.mean(laser_snr_values)) if laser_snr_values else float("nan"))
         history["mean_rf_ebno_db"].append(float(np.mean(rf_ebno_values)) if rf_ebno_values else float("nan"))
+        plane_differences: list[float] = []
+        planes = int(sync.get("orbital_planes", 1))
+        for plane in range(planes):
+            plane_offsets = np.asarray(
+                [sat.offset_ns for sat in satellites if sat.is_healthy and sat.orbital_plane == plane],
+                dtype=float,
+            )
+            plane_differences.append(float(np.ptp(plane_offsets)) if plane_offsets.size else float("nan"))
+
         history["active_measurements"].append(accepted_measurements)
+        history["per_orbital_plane_time_difference_ns"].append(plane_differences)
 
     save_csv_outputs(history, run_dir)
     if config.get("outputs", {}).get("save_plots", True):
@@ -292,7 +527,7 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
         (
             int(step)
             for step, rms in zip(history["step"], history["rms_error_ns"])
-            if rms <= float(sim["convergence_threshold_ns"])
+            if rms <= float(sync.get("convergence_threshold_ns", sim["convergence_threshold_ns"]))
         ),
         None,
     )
@@ -301,12 +536,106 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
         "final_rms_error_ns": float(history["rms_error_ns"][-1]),
         "final_peak_to_peak_error_ns": float(history["peak_to_peak_error_ns"][-1]),
         "convergence_step": convergence_step,
+        "convergence_time_s": None if convergence_step is None else float(convergence_step * dt_s),
+        "maximum_time_difference_over_time_ns": float(np.nanmax(history["peak_to_peak_error_ns"])),
+        "peak_to_peak_time_difference_after_convergence_ns": (
+            float(history["peak_to_peak_error_ns"][convergence_step])
+            if convergence_step is not None
+            else float(history["peak_to_peak_error_ns"][-1])
+        ),
+        "per_orbital_plane_time_differences_final_ns": history["per_orbital_plane_time_difference_ns"][-1],
         "accepted_measurements_total": int(np.sum(history["active_measurements"])),
     }
     with (run_dir / "summary.json").open("w", encoding="utf-8") as file_obj:
         json.dump(summary, file_obj, indent=2, sort_keys=True)
         file_obj.write("\n")
     return {"history": history, "summary": summary}
+
+
+def _scenario_config(config: dict[str, Any], scenario_name: str) -> dict[str, Any]:
+    scenario_config = copy.deepcopy(config)
+    scenario_config["simulation"]["name"] = f"{config['simulation'].get('name', 'simulation')}_{scenario_name}"
+    return scenario_config
+
+
+def baseline_is_dts(config: dict[str, Any]) -> dict[str, Any]:
+    """Run the paper baseline IS-DTS scenario with the configured 0.4 s interval."""
+
+    scenario_config = _scenario_config(config, "baseline_is_dts")
+    run_dir = create_output_directory(scenario_config)
+    return run_single_simulation(scenario_config, run_dir)
+
+
+def adjustment_interval_comparison(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Run IS-DTS for each paper adjustment-interval comparison value."""
+
+    results: list[dict[str, Any]] = []
+    sync = time_sync_config(config)
+    for interval_s in sync.get("adjustment_interval_scenarios", [adjustment_interval_s(config)]):
+        scenario_config = _scenario_config(config, f"adjustment_{interval_s:g}s")
+        scenario_config.setdefault("is_dts_simulation", copy.deepcopy(sync))
+        scenario_config["is_dts_simulation"]["time_adjustment_interval_s"] = float(interval_s)
+        run_dir = create_output_directory(scenario_config)
+        result = run_single_simulation(scenario_config, run_dir)
+        results.append({"adjustment_interval_s": float(interval_s), **result["summary"]})
+    return results
+
+
+def ptp_comparison(config: dict[str, Any]) -> dict[str, float]:
+    """Return paper comparison targets for traditional PTP on the same constellation."""
+
+    expected = time_sync_config(config).get("expected_results", {})
+    return {
+        "same_plane_peak_to_peak_time_difference_ns": float(
+            expected.get("traditional_ptp_same_plane_peak_to_peak_ns", 23.01)
+        ),
+        "different_plane_time_difference_s": float(
+            expected.get("traditional_ptp_different_plane_time_difference_s", 2.15e-6)
+        ),
+    }
+
+
+def polar_topology_robustness(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compare dynamic polar ISL disconnection with stable polar-region ISLs."""
+
+    results: list[dict[str, Any]] = []
+    for disconnect in (True, False):
+        label = "polar_disconnect" if disconnect else "polar_stable"
+        scenario_config = _scenario_config(config, label)
+        sync = time_sync_config(scenario_config)
+        scenario_config.setdefault("is_dts_simulation", copy.deepcopy(sync))
+        scenario_config["is_dts_simulation"]["polar_cross_plane_disconnect"] = disconnect
+        run_dir = create_output_directory(scenario_config)
+        result = run_single_simulation(scenario_config, run_dir)
+        results.append({"polar_cross_plane_disconnect": disconnect, **result["summary"]})
+    return results
+
+
+def node_failure_robustness(config: dict[str, Any]) -> dict[str, Any]:
+    """Run the paper node-failure scenario using configured failure windows."""
+
+    scenario_config = _scenario_config(config, "node_failure_robustness")
+    run_dir = create_output_directory(scenario_config)
+    return run_single_simulation(scenario_config, run_dir)
+
+
+def print_summary(summary: dict[str, Any]) -> None:
+    """Print paper-comparison metrics for a run or scenario summary."""
+
+    print(f"Run directory: {summary['run_dir']}")
+    print(
+        "Maximum time difference over time: "
+        f"{summary['maximum_time_difference_over_time_ns']:.3f} ns"
+    )
+    print(
+        "Peak-to-peak time difference after convergence: "
+        f"{summary['peak_to_peak_time_difference_after_convergence_ns']:.3f} ns"
+    )
+    print(f"Convergence time estimate: {summary['convergence_time_s']} s")
+    print(
+        "Final per-orbital-plane time differences: "
+        f"{summary['per_orbital_plane_time_differences_final_ns']} ns"
+    )
 
 
 
@@ -318,9 +647,9 @@ def _expand_satellite_errors(
 ) -> np.ndarray:
     """Create a 72-satellite-style plot matrix from available simulation offsets.
 
-    Temporary demo adapter: the current default simulation uses fewer satellites
-    than the 72-satellite reference constellation.  Real 72-node runs can replace
-    this expansion by passing their native ``clock_offsets_ns`` history directly.
+    Legacy demo adapter: older configurations can use fewer satellites than the
+    paper's 72-satellite reference constellation. Paper-aligned runs pass their
+    native 72-node ``clock_offsets_ns`` history directly.
     """
 
     if offsets_ns.shape[1] >= target_satellites:
@@ -354,27 +683,28 @@ def build_reference_plot_data(history: dict[str, Any], config: dict[str, Any]) -
     """
 
     sim = config["simulation"]
+    sync = time_sync_config(config)
     rng = np.random.default_rng(int(sim["seed"]) + 10_000)
     steps = np.asarray(history["step"], dtype=float)
-    time = steps * float(sim["time_step_s"])
+    time = steps * simulation_time_step_s(config)
     offsets_ns = np.asarray(history["clock_offsets_ns"], dtype=float)
 
-    reference_satellites = 72
-    orbit_count = 6
+    reference_satellites = int(sync.get("satellite_count", 72))
+    orbit_count = int(sync.get("orbital_planes", 6))
     isdts_errors_s = _expand_satellite_errors(offsets_ns, reference_satellites, rng)
     orbit_indices = _orbit_indices(reference_satellites, orbit_count)
 
     initial_p2p_s = max(float(np.nanmax(np.ptp(isdts_errors_s, axis=1))), 1e-12)
     final_floor_s = max(float(np.nanmedian(np.abs(isdts_errors_s[-10:]))), 2.0e-10)
     diff_by_interval: dict[float, np.ndarray] = {}
-    for interval in (0.25, 0.45, 0.65):
+    for interval in sync.get("adjustment_interval_scenarios", [0.2, 0.4, 0.8]):
         decay_rate = 4.5 / max(interval, 1e-9)
         normalized_time = (time - time[0]) / max(time[-1] - time[0], 1.0)
         curve = initial_p2p_s * np.exp(-decay_rate * normalized_time)
         ripple = 1.0 + 0.08 * np.sin(2.0 * np.pi * normalized_time * (1.0 + interval))
         diff_by_interval[interval] = np.maximum(curve * ripple + final_floor_s * (1.0 + interval), 1e-12)
 
-    same_orbit_count = 12
+    same_orbit_count = int(sync.get("satellites_per_plane", 12))
     same_orbit_base = 2.5e-9 * np.exp(-3.0 * time / max(time[-1], 1.0))
     end_drift = 8.0e-9 * np.clip((time - 0.78 * time[-1]) / max(0.22 * time[-1], 1.0), 0.0, 1.0) ** 2
     same_orbit_data = np.empty((time.size, same_orbit_count), dtype=float)
@@ -389,7 +719,9 @@ def build_reference_plot_data(history: dict[str, Any], config: dict[str, Any]) -
         curvature = -(orbit + 1) * 5.5e-10 * (time / max(time[-1], 1.0)) ** 2
         different_orbit_data[:, orbit] = slope * time + curvature
 
-    failed_satellites = [8, 43]
+    failed_satellites = [paper_failure_node_id(event, config) for event in sync.get("failure_scenarios", [])]
+    if not failed_satellites:
+        failed_satellites = [8, 43]
     robustness_errors_s = isdts_errors_s.copy()
     failure_start = max(1, int(0.35 * len(time)))
     robustness_errors_s[failure_start:, failed_satellites] = np.nan
@@ -566,6 +898,17 @@ def main() -> None:
     parser.add_argument("--parameters", default=str(DEFAULT_PARAMETERS_FILE), help="Path to JSON parameters file")
     parser.add_argument("--monte-carlo", action="store_true", help="Force Monte Carlo mode on")
     parser.add_argument("--single-run", action="store_true", help="Force a single run even if parameters enable Monte Carlo")
+    parser.add_argument(
+        "--scenario",
+        choices=[
+            "baseline_is_dts",
+            "adjustment_interval_comparison",
+            "ptp_comparison",
+            "polar_topology_robustness",
+            "node_failure_robustness",
+        ],
+        help="Run one paper comparison scenario",
+    )
     args = parser.parse_args()
 
     config = load_parameters(args.parameters)
@@ -574,18 +917,43 @@ def main() -> None:
     if args.single_run:
         config["monte_carlo"]["enabled"] = False
 
-    if config.get("monte_carlo", {}).get("enabled", False):
+    if args.scenario == "baseline_is_dts":
+        result = baseline_is_dts(config)
+        print_summary(result["summary"])
+    elif args.scenario == "adjustment_interval_comparison":
+        summaries = adjustment_interval_comparison(config)
+        for summary in summaries:
+            print(
+                f"Adjustment interval {summary['adjustment_interval_s']:.1f} s: "
+                f"convergence time {summary['convergence_time_s']} s"
+            )
+    elif args.scenario == "ptp_comparison":
+        summary = ptp_comparison(config)
+        print(
+            "Traditional PTP same-plane peak-to-peak time difference: "
+            f"{summary['same_plane_peak_to_peak_time_difference_ns']:.2f} ns"
+        )
+        print(
+            "Traditional PTP different-plane time difference: "
+            f"{summary['different_plane_time_difference_s']:.3e} s"
+        )
+    elif args.scenario == "polar_topology_robustness":
+        summaries = polar_topology_robustness(config)
+        for summary in summaries:
+            print(
+                f"Polar disconnect={summary['polar_cross_plane_disconnect']}: "
+                f"final peak-to-peak {summary['final_peak_to_peak_error_ns']:.3f} ns"
+            )
+    elif args.scenario == "node_failure_robustness":
+        result = node_failure_robustness(config)
+        print_summary(result["summary"])
+    elif config.get("monte_carlo", {}).get("enabled", False):
         summaries = run_monte_carlo(config)
         print(f"Completed {len(summaries)} Monte Carlo draws")
     else:
         run_dir = create_output_directory(config)
         result = run_single_simulation(config, run_dir)
-        print(f"Run directory: {result['summary']['run_dir']}")
-        print(
-            "Final RMS error: "
-            f"{result['summary']['final_rms_error_ns']:.3f} ns; "
-            f"convergence step: {result['summary']['convergence_step']}"
-        )
+        print_summary(result["summary"])
 
 
 if __name__ == "__main__":
