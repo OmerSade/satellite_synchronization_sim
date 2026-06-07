@@ -144,19 +144,13 @@ def sample_monte_carlo_value(spec: dict[str, Any], rng: np.random.Generator) -> 
 
 
 def time_sync_config(config: dict[str, Any]) -> dict[str, Any]:
-    """Return IS-DTS settings, falling back to legacy ``simulation`` keys.
+    """Return the required paper-aligned IS-DTS parameter section."""
 
-    The ``is_dts_simulation`` section contains the paper-derived Walker
-    constellation, DES, topology, and scenario parameters.  Legacy simulations
-    that only define ``simulation`` continue to run with their existing values.
-    """
-
-    return config.get("is_dts_simulation", config["simulation"])
+    return config["is_dts_simulation"]
 
 
 def simulation_time_step_s(config: dict[str, Any]) -> float:
-    sync = time_sync_config(config)
-    return float(sync.get("des_time_step_s", config["simulation"].get("time_step_s", 1.0)))
+    return float(time_sync_config(config)["des_time_step_s"])
 
 
 def adjustment_interval_s(config: dict[str, Any]) -> float:
@@ -166,10 +160,9 @@ def adjustment_interval_s(config: dict[str, Any]) -> float:
 
 def simulation_duration_s(config: dict[str, Any]) -> float:
     sync = time_sync_config(config)
-    sim = config["simulation"]
     if "duration_s" in sync:
         return float(sync["duration_s"])
-    return int(sim.get("steps", 1)) * simulation_time_step_s(config)
+    return int(sync["steps"]) * simulation_time_step_s(config)
 
 
 def simulation_step_count(config: dict[str, Any]) -> int:
@@ -180,38 +173,29 @@ def simulation_step_count(config: dict[str, Any]) -> int:
 
 
 def paper_satellite_count(config: dict[str, Any]) -> int:
-    sync = time_sync_config(config)
-    return int(sync.get("satellite_count", config["simulation"].get("satellite_count", 1)))
+    return int(time_sync_config(config)["satellite_count"])
 
 
 def create_satellites(config: dict[str, Any], rng: np.random.Generator) -> list[Satellite]:
-    sim = config["simulation"]
     sync = time_sync_config(config)
     count = paper_satellite_count(config)
-    planes = int(sync.get("orbital_planes", 1))
-    satellites_per_plane = int(sync.get("satellites_per_plane", max(1, count // max(planes, 1))))
+    satellites_per_plane = int(sync["satellites_per_plane"])
 
-    max_initial_offset_s = sync.get("max_initial_time_offset_s")
-    oscillator_accuracy = sync.get("oscillator_frequency_accuracy")
+    max_initial_offset_s = float(sync["max_initial_time_offset_s"])
+    oscillator_accuracy = float(sync["oscillator_frequency_accuracy"])
     satellites: list[Satellite] = []
     for node_id in range(count):
-        if max_initial_offset_s is None:
-            offset_ns = float(rng.normal(0.0, sim.get("initial_offset_std_ns", 0.0)))
-        else:
-            # Paper parameter: initial satellite clock offsets are uniformly
-            # distributed within ±1 s for the IS-DTS DES experiments.
-            offset_ns = float(
-                rng.uniform(-float(max_initial_offset_s), float(max_initial_offset_s)) * 1e9
-            )
+        # Paper parameter: initial satellite clock offsets are uniformly
+        # distributed within ±1 s for the IS-DTS DES experiments.
+        offset_ns = float(
+            rng.uniform(-max_initial_offset_s, max_initial_offset_s) * 1e9
+        )
 
-        if oscillator_accuracy is None:
-            drift_ns_per_s = float(rng.normal(0.0, sim.get("initial_drift_std_ns_per_s", 0.0)))
-        else:
-            # Fractional oscillator frequency accuracy maps directly to clock
-            # drift in seconds per second; store as ns/s for the local model.
-            drift_ns_per_s = float(
-                rng.uniform(-float(oscillator_accuracy), float(oscillator_accuracy)) * 1e9
-            )
+        # Fractional oscillator frequency accuracy maps directly to clock
+        # drift in seconds per second; store as ns/s for the local model.
+        drift_ns_per_s = float(
+            rng.uniform(-oscillator_accuracy, oscillator_accuracy) * 1e9
+        )
 
         satellites.append(
             Satellite(
@@ -223,7 +207,7 @@ def create_satellites(config: dict[str, Any], rng: np.random.Generator) -> list[
             )
         )
 
-    for node_id in sim.get("faulty_nodes", []):
+    for node_id in sync.get("faulty_nodes", []):
         satellites[int(node_id)].state = SatelliteState.FAULTY
     return satellites
 
@@ -265,31 +249,10 @@ def build_walker_mesh_topology(config: dict[str, Any]) -> list[tuple[int, int, s
     return sorted(edges)
 
 
-def build_legacy_topology(config: dict[str, Any], rng: np.random.Generator) -> list[tuple[int, int, str]]:
-    """Build the previous ring-plus-random-crosslink topology for legacy configs."""
+def build_topology(config: dict[str, Any]) -> list[tuple[int, int, str]]:
+    """Build the deterministic paper Walker mesh topology."""
 
-    sim = config["simulation"]
-    count = int(sim["satellite_count"])
-    edges: set[tuple[int, int, str]] = {
-        (min(index, (index + 1) % count), max(index, (index + 1) % count), "same_plane")
-        for index in range(count)
-    }
-    for index in range(count):
-        for other in range(index + 2, count):
-            if other == (index - 1) % count:
-                continue
-            if rng.random() < float(sim.get("crosslink_probability", 0.0)):
-                edges.add((index, other, "cross_plane"))
-    return sorted(edges)
-
-
-def build_topology(config: dict[str, Any], rng: np.random.Generator) -> list[tuple[int, int, str]]:
-    """Build IS-DTS topology, preferring deterministic paper Walker mesh settings."""
-
-    sync = time_sync_config(config)
-    if {"orbital_planes", "satellites_per_plane"}.issubset(sync):
-        return build_walker_mesh_topology(config)
-    return build_legacy_topology(config, rng)
+    return build_walker_mesh_topology(config)
 
 
 def satellite_latitude_deg(satellite: Satellite, true_time_s: float, config: dict[str, Any]) -> float:
@@ -353,22 +316,12 @@ def paper_failure_node_id(event: dict[str, Any], config: dict[str, Any]) -> int:
 def update_satellite_failures(
     satellites: list[Satellite], config: dict[str, Any], true_time_s: float, step: int
 ) -> None:
-    """Apply legacy step failures and paper time-window node failures."""
+    """Apply paper time-window node failures from ``is_dts_simulation`` only."""
 
-    sim = config["simulation"]
-    permanently_faulty = {int(node_id) for node_id in sim.get("faulty_nodes", [])}
-    active_failures: set[int] = set(permanently_faulty)
+    sync = time_sync_config(config)
+    active_failures: set[int] = {int(node_id) for node_id in sync.get("faulty_nodes", [])}
 
-    for event in sim.get("failure_events", []):
-        if "step" in event and int(event.get("step", -1)) == step:
-            active_failures.add(int(event["node_id"]))
-        elif "failure_start_s" in event:
-            start_s = float(event["failure_start_s"])
-            duration_s = float(event.get("failure_duration_s", 0.0))
-            if start_s <= true_time_s < start_s + duration_s:
-                active_failures.add(paper_failure_node_id(event, config))
-
-    for event in time_sync_config(config).get("failure_scenarios", []):
+    for event in sync.get("failure_scenarios", []):
         start_s = float(event["failure_start_s"])
         duration_s = float(event["failure_duration_s"])
         if start_s <= true_time_s < start_s + duration_s:
@@ -390,25 +343,25 @@ def make_rf_config(config: dict[str, Any]) -> RFReceiverConfig:
 
 
 def link_geometry(config: dict[str, Any], rng: np.random.Generator) -> tuple[LaserLinkGeometry, RFLinkGeometry]:
-    geo = config["geometry"]
-    range_m = max(1.0, float(geo["base_range_m"]) + float(rng.normal(0.0, geo["range_jitter_m"])))
+    geometry = time_sync_config(config)["link_geometry"]
+    range_m = max(
+        1.0,
+        float(geometry["base_range_m"])
+        + float(rng.normal(0.0, geometry["range_jitter_m"])),
+    )
     laser_geometry = LaserLinkGeometry(
         range_m=range_m,
-        elevation_deg=float(geo["elevation_deg"]),
-        pointing_error_rad=float(geo["pointing_error_rad"]),
-        zenith_transmittance=float(geo["zenith_transmittance"]),
+        elevation_deg=float(geometry["elevation_deg"]),
+        pointing_error_rad=float(geometry["pointing_error_rad"]),
+        zenith_transmittance=float(geometry["zenith_transmittance"]),
     )
     rf_geometry = RFLinkGeometry(
         range_m=range_m,
-        relative_velocity_m_per_s=float(rng.normal(0.0, geo["relative_velocity_std_m_per_s"])),
+        relative_velocity_m_per_s=float(
+            rng.normal(0.0, geometry["relative_velocity_std_m_per_s"])
+        ),
     )
     return laser_geometry, rf_geometry
-
-
-def apply_failure_events(satellites: list[Satellite], events: list[dict[str, Any]], step: int) -> None:
-    for event in events:
-        if int(event.get("step", -1)) == step:
-            satellites[int(event["node_id"])].state = SatelliteState.FAULTY
 
 
 def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[str, Any]:
@@ -418,15 +371,14 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
     run_dir.mkdir(parents=True, exist_ok=True)
     write_parameters(config, run_dir / "parameters.json")
 
-    sim = config["simulation"]
     sync = time_sync_config(config)
     dt_s = simulation_time_step_s(config)
     adjust_interval_s = adjustment_interval_s(config)
     adjust_every_steps = max(1, int(round(adjust_interval_s / dt_s)))
     total_steps = simulation_step_count(config)
-    rng = np.random.default_rng(int(sim["seed"]))
+    rng = np.random.default_rng(int(sync["seed"]))
     satellites = create_satellites(config, rng)
-    edges = build_topology(config, rng)
+    edges = build_topology(config)
     laser_config = make_laser_config(config)
     rf_config = make_rf_config(config)
 
@@ -454,7 +406,7 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
 
         if step % adjust_every_steps == 0:
             for left, right, edge_type in edges:
-                if rng.random() < float(sim.get("link_dropout_probability", 0.0)):
+                if rng.random() < float(sync.get("link_dropout_probability", 0.0)):
                     continue
                 if not is_edge_active(left, right, edge_type, satellites, true_time_s, config):
                     continue
@@ -476,7 +428,7 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
                     estimated_offset_ns = laser_measurement.estimated_offset_ns
                     if send_timing_noise_ns:
                         estimated_offset_ns += float(rng.uniform(-send_timing_noise_ns, send_timing_noise_ns))
-                    corrections[right].append(-float(sim["laser_weight"]) * estimated_offset_ns)
+                    corrections[right].append(-float(sync["laser_weight"]) * estimated_offset_ns)
                     accepted_measurements += 1
 
                 rf_receiver = SatelliteRFReceiver(receiver=sat_left, config=rf_config, rng=rng)
@@ -486,13 +438,13 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
                     estimated_offset_ns = rf_measurement.estimated_offset_ns
                     if send_timing_noise_ns:
                         estimated_offset_ns += float(rng.uniform(-send_timing_noise_ns, send_timing_noise_ns))
-                    corrections[left].append(-float(sim["rf_weight"]) * estimated_offset_ns)
+                    corrections[left].append(-float(sync["rf_weight"]) * estimated_offset_ns)
                     accepted_measurements += 1
 
         for node_id, node_corrections in corrections.items():
             if node_corrections:
                 satellites[node_id].apply_correction(
-                    float(sim["distributed_gain"]) * float(np.mean(node_corrections))
+                    float(sync["distributed_gain"]) * float(np.mean(node_corrections))
                 )
 
         offsets = np.asarray([sat.offset_ns for sat in satellites], dtype=float)
@@ -517,8 +469,9 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
         history["active_measurements"].append(accepted_measurements)
         history["per_orbital_plane_time_difference_ns"].append(plane_differences)
 
-    save_csv_outputs(history, run_dir)
-    if config.get("outputs", {}).get("save_plots", True):
+    if sync.get("save_csv", True):
+        save_csv_outputs(history, run_dir)
+    if sync.get("save_plots", True):
         plots = importlib.import_module("plots")
         plots.create_run_plots(history, run_dir)
         create_reference_figure_plots(history, config, run_dir)
@@ -527,7 +480,7 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
         (
             int(step)
             for step, rms in zip(history["step"], history["rms_error_ns"])
-            if rms <= float(sync.get("convergence_threshold_ns", sim["convergence_threshold_ns"]))
+            if rms <= float(sync["convergence_threshold_ns"])
         ),
         None,
     )
@@ -554,7 +507,8 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
 
 def _scenario_config(config: dict[str, Any], scenario_name: str) -> dict[str, Any]:
     scenario_config = copy.deepcopy(config)
-    scenario_config["simulation"]["name"] = f"{config['simulation'].get('name', 'simulation')}_{scenario_name}"
+    sync = time_sync_config(scenario_config)
+    sync["name"] = f"{time_sync_config(config).get('name', 'is_dts_simulation')}_{scenario_name}"
     return scenario_config
 
 
@@ -647,9 +601,9 @@ def _expand_satellite_errors(
 ) -> np.ndarray:
     """Create a 72-satellite-style plot matrix from available simulation offsets.
 
-    Legacy demo adapter: older configurations can use fewer satellites than the
-    paper's 72-satellite reference constellation. Paper-aligned runs pass their
-    native 72-node ``clock_offsets_ns`` history directly.
+    Paper-aligned runs pass their native 72-node ``clock_offsets_ns`` history
+    directly; this helper only truncates or tiles if a scenario-specific
+    satellite count differs from the configured reference size.
     """
 
     if offsets_ns.shape[1] >= target_satellites:
@@ -682,9 +636,8 @@ def build_reference_plot_data(history: dict[str, Any], config: dict[str, Any]) -
     later without changing the plotting API.
     """
 
-    sim = config["simulation"]
     sync = time_sync_config(config)
-    rng = np.random.default_rng(int(sim["seed"]) + 10_000)
+    rng = np.random.default_rng(int(sync["seed"]) + 10_000)
     steps = np.asarray(history["step"], dtype=float)
     time = steps * simulation_time_step_s(config)
     offsets_ns = np.asarray(history["clock_offsets_ns"], dtype=float)
@@ -842,10 +795,11 @@ def save_csv_outputs(history: dict[str, Any], run_dir: Path) -> None:
 
 
 def create_output_directory(config: dict[str, Any], suffix: str | None = None) -> Path:
-    root = Path(config.get("outputs", {}).get("root", "outputs"))
+    sync = time_sync_config(config)
+    root = Path(sync.get("output_root", "outputs"))
     root.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    name = config["simulation"].get("name", "simulation")
+    name = sync.get("name", "is_dts_simulation")
     run_name = f"{timestamp}_{name}" if suffix is None else f"{timestamp}_{name}_{suffix}"
     run_dir = root / run_name
     counter = 1
@@ -859,21 +813,21 @@ def create_output_directory(config: dict[str, Any], suffix: str | None = None) -
 def run_monte_carlo(config: dict[str, Any]) -> list[dict[str, Any]]:
     """Run repeated simulations with random draws from the parameter file."""
 
-    mc = config["monte_carlo"]
+    mc = time_sync_config(config).get("monte_carlo", {})
     root_run_dir = create_output_directory(config, suffix="monte_carlo")
     write_parameters(config, root_run_dir / "parameters.json")
-    rng = np.random.default_rng(int(mc.get("seed", config["simulation"]["seed"])))
+    rng = np.random.default_rng(int(mc.get("seed", time_sync_config(config)["seed"])))
     summaries: list[dict[str, Any]] = []
 
     for draw_index in range(int(mc["runs"])):
         draw_config = copy.deepcopy(config)
-        draw_config["monte_carlo"]["enabled"] = False
+        draw_config["is_dts_simulation"].setdefault("monte_carlo", {})["enabled"] = False
         draw_values: dict[str, float] = {}
         for key, spec in mc.get("vary", {}).items():
             value = sample_monte_carlo_value(spec, rng)
             nested_set(draw_config, key, value)
             draw_values[key] = value
-        draw_config["simulation"]["seed"] = int(rng.integers(0, 2**31 - 1))
+        draw_config["is_dts_simulation"]["seed"] = int(rng.integers(0, 2**31 - 1))
         draw_dir = root_run_dir / f"draw_{draw_index:03d}"
         draw_dir.mkdir(parents=True, exist_ok=True)
         write_parameters(draw_config, draw_dir / "parameters_draw.json")
@@ -887,7 +841,7 @@ def run_monte_carlo(config: dict[str, Any]) -> list[dict[str, Any]]:
     with (root_run_dir / "monte_carlo_summary.json").open("w", encoding="utf-8") as file_obj:
         json.dump(summaries, file_obj, indent=2, sort_keys=True)
         file_obj.write("\n")
-    if config.get("outputs", {}).get("save_plots", True):
+    if time_sync_config(config).get("save_plots", True):
         plots = importlib.import_module("plots")
         plots.plot_monte_carlo_summary(summaries, root_run_dir)
     return summaries
@@ -913,9 +867,9 @@ def main() -> None:
 
     config = load_parameters(args.parameters)
     if args.monte_carlo:
-        config["monte_carlo"]["enabled"] = True
+        time_sync_config(config).setdefault("monte_carlo", {})["enabled"] = True
     if args.single_run:
-        config["monte_carlo"]["enabled"] = False
+        time_sync_config(config).setdefault("monte_carlo", {})["enabled"] = False
 
     if args.scenario == "baseline_is_dts":
         result = baseline_is_dts(config)
@@ -947,7 +901,7 @@ def main() -> None:
     elif args.scenario == "node_failure_robustness":
         result = node_failure_robustness(config)
         print_summary(result["summary"])
-    elif config.get("monte_carlo", {}).get("enabled", False):
+    elif time_sync_config(config).get("monte_carlo", {}).get("enabled", False):
         summaries = run_monte_carlo(config)
         print(f"Completed {len(summaries)} Monte Carlo draws")
     else:
