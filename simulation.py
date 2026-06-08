@@ -286,6 +286,7 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
     if config.get("outputs", {}).get("save_plots", True):
         plots = importlib.import_module("plots")
         plots.create_run_plots(history, run_dir)
+        create_simulation_result_plots(history, config, run_dir)
 
     convergence_step = next(
         (
@@ -306,6 +307,324 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
         json.dump(summary, file_obj, indent=2, sort_keys=True)
         file_obj.write("\n")
     return {"history": history, "summary": summary}
+
+
+
+
+
+
+def first_config_value(config: dict[str, Any], dotted_keys: tuple[str, ...], default: Any = None) -> Any:
+    """Return the first present value from several supported parameter paths."""
+
+    for dotted_key in dotted_keys:
+        cursor: Any = config
+        for part in dotted_key.split("."):
+            if not isinstance(cursor, dict) or part not in cursor:
+                break
+            cursor = cursor[part]
+        else:
+            return cursor
+    return default
+
+
+def _plot_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return optional plot settings from either new or legacy parameter layouts."""
+
+    value = first_config_value(config, ("plots", "plotting", "plot", "figures", "outputs.plots"), {})
+    return value if isinstance(value, dict) else {}
+
+
+def _orbit_count_from_config(config: dict[str, Any], satellite_count: int) -> int:
+    """Read orbit-plane count from the parameter file using supported aliases."""
+
+    plot_cfg = _plot_config(config)
+    raw_value = first_config_value(
+        {**config, "_plot": plot_cfg},
+        (
+            "simulation.orbit_plane_count",
+            "simulation.orbit_planes",
+            "simulation.orbital_planes",
+            "simulation.orbit_count",
+            "simulation.num_orbits",
+            "simulation.num_orbit_planes",
+            "simulation.number_of_orbits",
+            "simulation.number_of_orbit_planes",
+            "constellation.orbit_plane_count",
+            "constellation.orbit_planes",
+            "constellation.orbital_planes",
+            "constellation.orbit_count",
+            "constellation.num_orbits",
+            "constellation.num_orbit_planes",
+            "constellation.number_of_orbits",
+            "constellation.number_of_orbit_planes",
+            "constellation.planes",
+            "constellation.orbits",
+            "_plot.orbit_plane_count",
+            "_plot.orbit_planes",
+            "_plot.orbital_planes",
+            "_plot.orbit_count",
+            "_plot.num_orbits",
+            "_plot.num_orbit_planes",
+            "_plot.number_of_orbits",
+            "_plot.number_of_orbit_planes",
+        ),
+    )
+    if raw_value is None:
+        satellites_per_orbit = first_config_value(
+            {**config, "_plot": plot_cfg},
+            (
+                "simulation.satellites_per_orbit",
+                "constellation.satellites_per_orbit",
+                "_plot.satellites_per_orbit",
+            ),
+        )
+        if satellites_per_orbit:
+            raw_value = int(np.ceil(satellite_count / int(satellites_per_orbit)))
+        else:
+            raw_value = 6
+    if isinstance(raw_value, (list, tuple)):
+        raw_value = len(raw_value)
+    return max(1, min(int(raw_value), int(satellite_count)))
+
+
+def _configured_orbit_indices(config: dict[str, Any], satellite_count: int) -> np.ndarray | None:
+    """Return explicit per-satellite orbit indices from the parameter file if present."""
+
+    plot_cfg = _plot_config(config)
+    raw_indices = first_config_value(
+        {**config, "_plot": plot_cfg},
+        (
+            "simulation.orbit_indices",
+            "simulation.orbit_plane_indices",
+            "constellation.orbit_indices",
+            "constellation.orbit_plane_indices",
+            "_plot.orbit_indices",
+            "_plot.orbit_plane_indices",
+        ),
+    )
+    if raw_indices is None:
+        return None
+
+    indices = np.asarray(raw_indices, dtype=int)
+    if indices.size != satellite_count:
+        raise ValueError(
+            "Configured orbit_indices/orbit_plane_indices must contain one value "
+            f"per satellite ({satellite_count} expected, {indices.size} received)."
+        )
+    return indices
+
+
+def _orbit_indices(satellite_count: int, orbit_count: int = 6) -> np.ndarray:
+    """Assign simulated satellites to equally sized orbital planes for plotting."""
+
+    bounded_orbit_count = max(1, min(int(orbit_count), int(satellite_count)))
+    return np.repeat(
+        np.arange(bounded_orbit_count),
+        int(np.ceil(satellite_count / bounded_orbit_count)),
+    )[:satellite_count]
+
+
+def _peak_to_peak_by_interval(history: dict[str, Any], config: dict[str, Any]) -> dict[float, np.ndarray]:
+    """Return only peak-to-peak interval data that exists in simulation outputs."""
+
+    if "peak_to_peak_by_interval_s" in history:
+        return {
+            float(interval): np.asarray(values, dtype=float)
+            for interval, values in history["peak_to_peak_by_interval_s"].items()
+        }
+    if "peak_to_peak_by_interval_ns" in history:
+        return {
+            float(interval): np.asarray(values, dtype=float) * 1e-9
+            for interval, values in history["peak_to_peak_by_interval_ns"].items()
+        }
+
+    sim = config["simulation"]
+    return {float(sim["time_step_s"]): np.asarray(history["peak_to_peak_error_ns"], dtype=float) * 1e-9}
+
+
+def _ptp_history_arrays(history: dict[str, Any]) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return real PTP arrays from history when the simulator provides them."""
+
+    same_keys = ("traditional_ptp_same_orbit_s", "ptp_same_orbit_s", "same_orbit_ptp_s")
+    different_keys = (
+        "traditional_ptp_different_orbit_s",
+        "ptp_different_orbit_s",
+        "different_orbit_ptp_s",
+    )
+    same_data = next((history[key] for key in same_keys if key in history), None)
+    different_data = next((history[key] for key in different_keys if key in history), None)
+    if same_data is None or different_data is None:
+        return None
+    return np.asarray(same_data, dtype=float), np.asarray(different_data, dtype=float)
+
+
+def _figure_key(name: Any) -> str:
+    """Normalize figure names from parameter files to fig6/fig7/etc."""
+
+    normalized = str(name).lower().replace("_", "").replace("-", "").replace(" ", "")
+    if normalized.startswith("figure"):
+        normalized = "fig" + normalized.removeprefix("figure")
+    return normalized
+
+
+def _figure_enabled(value: Any) -> bool:
+    """Return whether a figure entry from a parameter file is enabled."""
+
+    if isinstance(value, dict):
+        return bool(value.get("enabled", True))
+    return bool(value)
+
+
+def _enabled_result_figures(config: dict[str, Any]) -> set[str]:
+    """Read optional figure enablement from the new plotting parameter section."""
+
+    plot_cfg = _plot_config(config)
+    if plot_cfg.get("enabled") is False:
+        return set()
+    raw_figures = plot_cfg.get("enabled_figures", plot_cfg.get("figures"))
+    if raw_figures is None:
+        return {"fig6", "fig7", "fig8", "fig9"}
+    if isinstance(raw_figures, dict):
+        return {_figure_key(name) for name, enabled in raw_figures.items() if _figure_enabled(enabled)}
+    return {_figure_key(name) for name in raw_figures}
+
+
+def _result_plot_dir(config: dict[str, Any], run_dir: str | Path) -> Path:
+    """Resolve result-plot output directory from the parameter file."""
+
+    plot_cfg = _plot_config(config)
+    raw_dir = first_config_value(
+        {**config, "_plot": plot_cfg},
+        ("outputs.result_plots_dir", "outputs.plots_dir", "outputs.plot_dir", "outputs.figure_dir", "_plot.output_dir", "_plot.results_dir", "_plot.plot_dir"),
+        "results/plots",
+    )
+    path = Path(raw_dir)
+    return path if path.is_absolute() else Path(run_dir) / path
+
+
+def build_simulation_plot_data(history: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Build plotting arrays using the current parameter schema and simulation data.
+
+    The function supports the newer parameter-file locations for orbit metadata,
+    figure toggles, and plot output settings while still avoiding synthetic fixed
+    traces.  PTP arrays are passed through only when the simulator has produced
+    real PTP values in ``history``.
+    """
+
+    sim = config["simulation"]
+    steps = np.asarray(history["step"], dtype=float)
+    time = steps * float(sim["time_step_s"])
+    offsets_s = np.asarray(history["clock_offsets_ns"], dtype=float) * 1e-9
+    satellite_count = offsets_s.shape[1]
+    explicit_orbit_indices = _configured_orbit_indices(config, satellite_count)
+    orbit_indices = (
+        explicit_orbit_indices
+        if explicit_orbit_indices is not None
+        else _orbit_indices(satellite_count, _orbit_count_from_config(config, satellite_count))
+    )
+
+    failed_satellites = sorted(
+        {
+            int(node_id)
+            for node_id in sim.get("faulty_nodes", [])
+        }
+        | {
+            int(event["node_id"])
+            for event in sim.get("failure_events", [])
+            if "node_id" in event
+        }
+    )
+
+    data: dict[str, Any] = {
+        "time": time,
+        "time_errors_s": offsets_s,
+        "orbit_indices": orbit_indices,
+        "peak_to_peak_by_interval": _peak_to_peak_by_interval(history, config),
+        "failed_satellites": failed_satellites,
+    }
+
+    ptp_arrays = _ptp_history_arrays(history)
+    if ptp_arrays is not None:
+        data["same_orbit_ptp_s"], data["different_orbit_ptp_s"] = ptp_arrays
+
+    return data
+
+
+def create_simulation_result_plots(
+    history: dict[str, Any],
+    config: dict[str, Any],
+    run_dir: str | Path,
+) -> list[Path]:
+    """Generate publication-style plots that are backed by simulation outputs."""
+
+    plots = importlib.import_module("plots")
+    plot_dir = _result_plot_dir(config, run_dir)
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    data = build_simulation_plot_data(history, config)
+    enabled_figures = _enabled_result_figures(config)
+
+    figure_specs = []
+    if "fig6" in enabled_figures:
+        figure_specs.append(
+            (
+                "fig6_isdts_results.png",
+                plots.plot_isdts_results(
+                    data["time"],
+                    data["time_errors_s"],
+                    data["orbit_indices"],
+                    save_path=plot_dir / "fig6_isdts_results.png",
+                ),
+            )
+        )
+
+    if "fig7" in enabled_figures:
+        figure_specs.append(
+            (
+                "fig7_peak_to_peak_difference.png",
+                plots.plot_peak_to_peak_difference(
+                    data["time"],
+                    data["peak_to_peak_by_interval"],
+                    save_path=plot_dir / "fig7_peak_to_peak_difference.png",
+                ),
+            )
+        )
+
+    if "fig8" in enabled_figures and "same_orbit_ptp_s" in data and "different_orbit_ptp_s" in data:
+        figure_specs.append(
+            (
+                "fig8_traditional_ptp.png",
+                plots.plot_traditional_ptp_performance(
+                    data["time"],
+                    data["same_orbit_ptp_s"],
+                    data["different_orbit_ptp_s"],
+                    save_path=plot_dir / "fig8_traditional_ptp.png",
+                ),
+            )
+        )
+
+    if "fig9" in enabled_figures and data["failed_satellites"]:
+        figure_specs.append(
+            (
+                "fig9_robustness.png",
+                plots.plot_robustness_results(
+                    data["time"],
+                    data["time_errors_s"],
+                    data["orbit_indices"],
+                    failed_satellites=data["failed_satellites"],
+                    save_path=plot_dir / "fig9_robustness.png",
+                ),
+            )
+        )
+
+    # Plotting functions return figures for reuse/display; close them here so
+    # batch simulation runs do not accumulate GUI resources.
+    import matplotlib.pyplot as plt
+
+    saved_paths: list[Path] = []
+    for filename, figure in figure_specs:
+        saved_paths.append(plot_dir / filename)
+        plt.close(figure)
+    return saved_paths
 
 
 def save_csv_outputs(history: dict[str, Any], run_dir: Path) -> None:
