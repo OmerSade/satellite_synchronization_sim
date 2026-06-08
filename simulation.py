@@ -474,7 +474,7 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
     if sync.get("save_plots", True):
         plots = importlib.import_module("plots")
         plots.create_run_plots(history, run_dir)
-        create_reference_figure_plots(history, config, run_dir)
+        create_simulation_result_plots(history, config, run_dir)
 
     convergence_step = next(
         (
@@ -505,216 +505,81 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
     return {"history": history, "summary": summary}
 
 
-def _scenario_config(config: dict[str, Any], scenario_name: str) -> dict[str, Any]:
-    scenario_config = copy.deepcopy(config)
-    sync = time_sync_config(scenario_config)
-    sync["name"] = f"{time_sync_config(config).get('name', 'is_dts_simulation')}_{scenario_name}"
-    return scenario_config
 
-
-def baseline_is_dts(config: dict[str, Any]) -> dict[str, Any]:
-    """Run the paper baseline IS-DTS scenario with the configured 0.4 s interval."""
-
-    scenario_config = _scenario_config(config, "baseline_is_dts")
-    run_dir = create_output_directory(scenario_config)
-    return run_single_simulation(scenario_config, run_dir)
-
-
-def adjustment_interval_comparison(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Run IS-DTS for each paper adjustment-interval comparison value."""
-
-    results: list[dict[str, Any]] = []
-    sync = time_sync_config(config)
-    for interval_s in sync.get("adjustment_interval_scenarios", [adjustment_interval_s(config)]):
-        scenario_config = _scenario_config(config, f"adjustment_{interval_s:g}s")
-        scenario_config.setdefault("is_dts_simulation", copy.deepcopy(sync))
-        scenario_config["is_dts_simulation"]["time_adjustment_interval_s"] = float(interval_s)
-        run_dir = create_output_directory(scenario_config)
-        result = run_single_simulation(scenario_config, run_dir)
-        results.append({"adjustment_interval_s": float(interval_s), **result["summary"]})
-    return results
-
-
-def ptp_comparison(config: dict[str, Any]) -> dict[str, float]:
-    """Return paper comparison targets for traditional PTP on the same constellation."""
-
-    expected = time_sync_config(config).get("expected_results", {})
-    return {
-        "same_plane_peak_to_peak_time_difference_ns": float(
-            expected.get("traditional_ptp_same_plane_peak_to_peak_ns", 23.01)
-        ),
-        "different_plane_time_difference_s": float(
-            expected.get("traditional_ptp_different_plane_time_difference_s", 2.15e-6)
-        ),
-    }
-
-
-def polar_topology_robustness(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """Compare dynamic polar ISL disconnection with stable polar-region ISLs."""
-
-    results: list[dict[str, Any]] = []
-    for disconnect in (True, False):
-        label = "polar_disconnect" if disconnect else "polar_stable"
-        scenario_config = _scenario_config(config, label)
-        sync = time_sync_config(scenario_config)
-        scenario_config.setdefault("is_dts_simulation", copy.deepcopy(sync))
-        scenario_config["is_dts_simulation"]["polar_cross_plane_disconnect"] = disconnect
-        run_dir = create_output_directory(scenario_config)
-        result = run_single_simulation(scenario_config, run_dir)
-        results.append({"polar_cross_plane_disconnect": disconnect, **result["summary"]})
-    return results
-
-
-def node_failure_robustness(config: dict[str, Any]) -> dict[str, Any]:
-    """Run the paper node-failure scenario using configured failure windows."""
-
-    scenario_config = _scenario_config(config, "node_failure_robustness")
-    run_dir = create_output_directory(scenario_config)
-    return run_single_simulation(scenario_config, run_dir)
-
-
-def print_summary(summary: dict[str, Any]) -> None:
-    """Print paper-comparison metrics for a run or scenario summary."""
-
-    print(f"Run directory: {summary['run_dir']}")
-    print(
-        "Maximum time difference over time: "
-        f"{summary['maximum_time_difference_over_time_ns']:.3f} ns"
-    )
-    print(
-        "Peak-to-peak time difference after convergence: "
-        f"{summary['peak_to_peak_time_difference_after_convergence_ns']:.3f} ns"
-    )
-    print(f"Convergence time estimate: {summary['convergence_time_s']} s")
-    print(
-        "Final per-orbital-plane time differences: "
-        f"{summary['per_orbital_plane_time_differences_final_ns']} ns"
-    )
-
-
-
-
-def _expand_satellite_errors(
-    offsets_ns: np.ndarray,
-    target_satellites: int,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Create a 72-satellite-style plot matrix from available simulation offsets.
-
-    Paper-aligned runs pass their native 72-node ``clock_offsets_ns`` history
-    directly; this helper only truncates or tiles if a scenario-specific
-    satellite count differs from the configured reference size.
-    """
-
-    if offsets_ns.shape[1] >= target_satellites:
-        expanded = offsets_ns[:, :target_satellites].copy()
-    else:
-        repeats = int(np.ceil(target_satellites / offsets_ns.shape[1]))
-        expanded = np.tile(offsets_ns, (1, repeats))[:, :target_satellites].copy()
-        scale = np.nanstd(offsets_ns, axis=1, keepdims=True)
-        scale = np.where(scale > 0.0, scale, 1.0)
-        expanded += rng.normal(0.0, 0.035, size=expanded.shape) * scale
-
-    # Figure-style convergence is shown relative to the constellation average.
-    expanded -= np.nanmean(expanded, axis=1, keepdims=True)
-    return expanded * 1e-9
 
 
 def _orbit_indices(satellite_count: int, orbit_count: int = 6) -> np.ndarray:
-    """Assign satellites to equally sized orbital planes for reference plots."""
+    """Assign simulated satellites to equally sized orbital planes for plotting."""
 
-    return np.repeat(np.arange(orbit_count), int(np.ceil(satellite_count / orbit_count)))[:satellite_count]
+    bounded_orbit_count = max(1, min(int(orbit_count), int(satellite_count)))
+    return np.repeat(
+        np.arange(bounded_orbit_count),
+        int(np.ceil(satellite_count / bounded_orbit_count)),
+    )[:satellite_count]
 
 
-def build_reference_plot_data(history: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
-    """Build arrays for the publication-style figures requested by the user.
+def build_simulation_plot_data(history: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Build plotting arrays only from values produced by the simulation.
 
-    Temporary demo data is generated only for data products that the compact
-    simulator does not yet model explicitly: alternate adjustment intervals,
-    traditional PTP baselines, and node-failure robustness traces.  The adapter
-    is intentionally isolated so it can be replaced by native simulation outputs
-    later without changing the plotting API.
+    This intentionally avoids bootstrapping or synthesizing fixed reference data.
+    Optional PTP arrays are passed through only if a caller or future simulator
+    version stores real PTP outputs in ``history``.
     """
 
-    sync = time_sync_config(config)
-    rng = np.random.default_rng(int(sync["seed"]) + 10_000)
+    sim = config["simulation"]
     steps = np.asarray(history["step"], dtype=float)
-    time = steps * simulation_time_step_s(config)
-    offsets_ns = np.asarray(history["clock_offsets_ns"], dtype=float)
+    time = steps * float(sim["time_step_s"])
+    offsets_s = np.asarray(history["clock_offsets_ns"], dtype=float) * 1e-9
+    satellite_count = offsets_s.shape[1]
+    orbit_count = int(sim.get("orbit_plane_count", 6))
+    orbit_indices = _orbit_indices(satellite_count, orbit_count)
+    peak_to_peak_s = np.asarray(history["peak_to_peak_error_ns"], dtype=float) * 1e-9
 
-    reference_satellites = int(sync.get("satellite_count", 72))
-    orbit_count = int(sync.get("orbital_planes", 6))
-    isdts_errors_s = _expand_satellite_errors(offsets_ns, reference_satellites, rng)
-    orbit_indices = _orbit_indices(reference_satellites, orbit_count)
-
-    initial_p2p_s = max(float(np.nanmax(np.ptp(isdts_errors_s, axis=1))), 1e-12)
-    final_floor_s = max(float(np.nanmedian(np.abs(isdts_errors_s[-10:]))), 2.0e-10)
-    diff_by_interval: dict[float, np.ndarray] = {}
-    for interval in sync.get("adjustment_interval_scenarios", [0.2, 0.4, 0.8]):
-        decay_rate = 4.5 / max(interval, 1e-9)
-        normalized_time = (time - time[0]) / max(time[-1] - time[0], 1.0)
-        curve = initial_p2p_s * np.exp(-decay_rate * normalized_time)
-        ripple = 1.0 + 0.08 * np.sin(2.0 * np.pi * normalized_time * (1.0 + interval))
-        diff_by_interval[interval] = np.maximum(curve * ripple + final_floor_s * (1.0 + interval), 1e-12)
-
-    same_orbit_count = int(sync.get("satellites_per_plane", 12))
-    same_orbit_base = 2.5e-9 * np.exp(-3.0 * time / max(time[-1], 1.0))
-    end_drift = 8.0e-9 * np.clip((time - 0.78 * time[-1]) / max(0.22 * time[-1], 1.0), 0.0, 1.0) ** 2
-    same_orbit_data = np.empty((time.size, same_orbit_count), dtype=float)
-    for sat_index in range(same_orbit_count):
-        noise = rng.normal(0.0, 5.0e-10, size=time.size)
-        bias = (sat_index - same_orbit_count / 2.0) * 2.5e-10
-        same_orbit_data[:, sat_index] = bias + same_orbit_base * np.sin(0.08 * time + sat_index) + noise - end_drift
-
-    different_orbit_data = np.empty((time.size, orbit_count), dtype=float)
-    for orbit in range(orbit_count):
-        slope = -(orbit + 1) * 2.2e-9 / max(time[-1], 1.0)
-        curvature = -(orbit + 1) * 5.5e-10 * (time / max(time[-1], 1.0)) ** 2
-        different_orbit_data[:, orbit] = slope * time + curvature
-
-    failed_satellites = [paper_failure_node_id(event, config) for event in sync.get("failure_scenarios", [])]
-    if not failed_satellites:
-        failed_satellites = [8, 43]
-    robustness_errors_s = isdts_errors_s.copy()
-    failure_start = max(1, int(0.35 * len(time)))
-    robustness_errors_s[failure_start:, failed_satellites] = np.nan
-    remaining = [idx for idx in range(reference_satellites) if idx not in failed_satellites]
-    robustness_errors_s[failure_start:, remaining] += rng.normal(
-        0.0,
-        final_floor_s * 0.35,
-        size=robustness_errors_s[failure_start:, remaining].shape,
+    failed_satellites = sorted(
+        {
+            int(node_id)
+            for node_id in sim.get("faulty_nodes", [])
+        }
+        | {
+            int(event["node_id"])
+            for event in sim.get("failure_events", [])
+            if "node_id" in event
+        }
     )
 
-    return {
+    data: dict[str, Any] = {
         "time": time,
-        "isdts_errors_s": isdts_errors_s,
+        "time_errors_s": offsets_s,
         "orbit_indices": orbit_indices,
-        "diff_by_interval": diff_by_interval,
-        "same_orbit_data": same_orbit_data,
-        "different_orbit_data": different_orbit_data,
-        "robustness_errors_s": robustness_errors_s,
+        "peak_to_peak_by_interval": {float(sim["time_step_s"]): peak_to_peak_s},
         "failed_satellites": failed_satellites,
     }
 
+    if "traditional_ptp_same_orbit_s" in history and "traditional_ptp_different_orbit_s" in history:
+        data["same_orbit_ptp_s"] = np.asarray(history["traditional_ptp_same_orbit_s"], dtype=float)
+        data["different_orbit_ptp_s"] = np.asarray(history["traditional_ptp_different_orbit_s"], dtype=float)
 
-def create_reference_figure_plots(
+    return data
+
+
+def create_simulation_result_plots(
     history: dict[str, Any],
     config: dict[str, Any],
     run_dir: str | Path,
 ) -> list[Path]:
-    """Generate the requested Figure 6-Figure 9 style plots for a run."""
+    """Generate publication-style plots that are backed by simulation outputs."""
 
     plots = importlib.import_module("plots")
     plot_dir = Path(run_dir) / "results" / "plots"
     plot_dir.mkdir(parents=True, exist_ok=True)
-    data = build_reference_plot_data(history, config)
+    data = build_simulation_plot_data(history, config)
 
     figure_specs = [
         (
             "fig6_isdts_results.png",
             plots.plot_isdts_results(
                 data["time"],
-                data["isdts_errors_s"],
+                data["time_errors_s"],
                 data["orbit_indices"],
                 save_path=plot_dir / "fig6_isdts_results.png",
             ),
@@ -723,30 +588,38 @@ def create_reference_figure_plots(
             "fig7_peak_to_peak_difference.png",
             plots.plot_peak_to_peak_difference(
                 data["time"],
-                data["diff_by_interval"],
+                data["peak_to_peak_by_interval"],
                 save_path=plot_dir / "fig7_peak_to_peak_difference.png",
             ),
         ),
-        (
-            "fig8_traditional_ptp.png",
-            plots.plot_traditional_ptp_performance(
-                data["time"],
-                data["same_orbit_data"],
-                data["different_orbit_data"],
-                save_path=plot_dir / "fig8_traditional_ptp.png",
-            ),
-        ),
-        (
-            "fig9_robustness.png",
-            plots.plot_robustness_results(
-                data["time"],
-                data["robustness_errors_s"],
-                data["orbit_indices"],
-                failed_satellites=data["failed_satellites"],
-                save_path=plot_dir / "fig9_robustness.png",
-            ),
-        ),
     ]
+
+    if "same_orbit_ptp_s" in data and "different_orbit_ptp_s" in data:
+        figure_specs.append(
+            (
+                "fig8_traditional_ptp.png",
+                plots.plot_traditional_ptp_performance(
+                    data["time"],
+                    data["same_orbit_ptp_s"],
+                    data["different_orbit_ptp_s"],
+                    save_path=plot_dir / "fig8_traditional_ptp.png",
+                ),
+            )
+        )
+
+    if data["failed_satellites"]:
+        figure_specs.append(
+            (
+                "fig9_robustness.png",
+                plots.plot_robustness_results(
+                    data["time"],
+                    data["time_errors_s"],
+                    data["orbit_indices"],
+                    failed_satellites=data["failed_satellites"],
+                    save_path=plot_dir / "fig9_robustness.png",
+                ),
+            )
+        )
 
     # Plotting functions return figures for reuse/display; close them here so
     # batch simulation runs do not accumulate GUI resources.

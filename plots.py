@@ -46,11 +46,12 @@ def _plot_waterfall_lines(
     stride: int = 1,
     line_cmap: str = "coolwarm",
     y_label: str = "Satellite / run index",
-    z_label: str = "Time Difference [s]",
+    z_label: str = "Absolute Time Difference [s]",
 ) -> None:
     """Draw a clean 3D stacked-line/waterfall convergence view."""
 
-    satellite_count = errors.shape[1]
+    display_errors = np.abs(errors)
+    satellite_count = display_errors.shape[1]
     selected = np.arange(0, satellite_count, max(1, stride), dtype=int)
     colors = plt.get_cmap(line_cmap)(np.linspace(0.1, 0.9, len(selected)))
 
@@ -58,13 +59,13 @@ def _plot_waterfall_lines(
         ax.plot(
             time,
             np.full_like(time, sat_index, dtype=float),
-            errors[:, sat_index],
+            display_errors[:, sat_index],
             color=color,
             linewidth=1.2,
             alpha=0.92,
         )
 
-    mean_error = np.nanmean(errors, axis=1)
+    mean_error = np.nanmean(display_errors, axis=1)
     ax.plot(
         time,
         np.full_like(time, satellite_count, dtype=float),
@@ -87,6 +88,94 @@ def _orbit_styles(orbit_count: int) -> tuple[np.ndarray, list[str]]:
     return colors, markers
 
 
+def _resolve_orbit_indices(
+    satellite_count: int,
+    orbit_indices: np.ndarray | list[int] | None,
+    *,
+    default_orbit_count: int = 6,
+) -> tuple[np.ndarray, int]:
+    """Return one orbit-plane index per satellite and the number of planes."""
+
+    if orbit_indices is None:
+        if satellite_count % default_orbit_count == 0:
+            orbit_count = default_orbit_count
+        else:
+            orbit_count = max(1, min(default_orbit_count, satellite_count))
+        indexes = np.repeat(np.arange(orbit_count), int(np.ceil(satellite_count / orbit_count)))[
+            :satellite_count
+        ]
+    else:
+        indexes = np.asarray(orbit_indices, dtype=int)
+        if indexes.size != satellite_count:
+            raise ValueError("orbit_indices must have the same length as the satellite dimension")
+        orbit_count = int(np.nanmax(indexes)) + 1 if satellite_count else 0
+    return indexes, orbit_count
+
+
+def _orbit_convergence_from_satellites(
+    time_errors: np.ndarray,
+    orbit_indices: np.ndarray | list[int] | None = None,
+) -> tuple[np.ndarray, np.ndarray, int]:
+    """Average per-orbit convergence errors relative to all satellites.
+
+    Figure 6(a) uses one line per orbit.  At each time step, every satellite's
+    value is first referenced to the average value of the full constellation.
+    The absolute value of that difference is then averaged across satellites in
+    the same orbit, so the trace shows difference magnitude rather than signed
+    direction.
+    """
+
+    errors = _as_2d_time_satellite(time_errors, "time_errors")
+    indexes, orbit_count = _resolve_orbit_indices(errors.shape[1], orbit_indices)
+    referenced_errors = np.abs(errors - np.nanmean(errors, axis=1, keepdims=True))
+    orbit_errors = np.empty((errors.shape[0], orbit_count), dtype=float)
+    for orbit in range(orbit_count):
+        orbit_mask = indexes == orbit
+        orbit_errors[:, orbit] = np.nanmean(referenced_errors[:, orbit_mask], axis=1)
+    return orbit_errors, indexes, orbit_count
+
+
+def _plot_orbit_waterfall_lines(
+    ax: Any,
+    time: np.ndarray,
+    time_errors: np.ndarray,
+    orbit_indices: np.ndarray | list[int] | None = None,
+) -> None:
+    """Draw Figure 6(a)-style 3D lines where each line is one orbit plane."""
+
+    orbit_errors, _, orbit_count = _orbit_convergence_from_satellites(time_errors, orbit_indices)
+    colors, markers = _orbit_styles(orbit_count)
+    for orbit in range(orbit_count):
+        y_value = orbit + 1
+        ax.plot(
+            time,
+            np.full_like(time, y_value, dtype=float),
+            orbit_errors[:, orbit],
+            color=colors[orbit],
+            linewidth=1.8,
+            marker=markers[orbit % len(markers)],
+            markevery=max(1, len(time) // 8),
+            markersize=3.5,
+            label=f"Orbit {y_value}",
+        )
+    ax.plot(
+        time,
+        np.full_like(time, orbit_count + 1, dtype=float),
+        np.zeros_like(time, dtype=float),
+        color="black",
+        linestyle="--",
+        linewidth=1.2,
+        label="72-satellite average",
+    )
+    ax.set_xlabel("Time [s]", labelpad=8)
+    ax.set_ylabel("Orbit plane", labelpad=8)
+    ax.set_zlabel("Absolute time error vs. 72-satellite average [s]", labelpad=8)
+    ax.set_yticks(np.arange(1, orbit_count + 1))
+    ax.set_yticklabels([f"Orbit {orbit + 1}" for orbit in range(orbit_count)])
+    ax.view_init(elev=25, azim=-58)
+    ax.grid(True, alpha=0.25)
+
+
 def plot_isdts_convergence(
     time: np.ndarray | list[float],
     time_errors: np.ndarray | list[list[float]],
@@ -94,8 +183,9 @@ def plot_isdts_convergence(
     *,
     title: str = "IS-DTS convergence results",
     satellite_stride: int = 1,
+    orbit_indices: np.ndarray | list[int] | None = None,
 ) -> plt.Figure:
-    """Create a 3D waterfall plot of IS-DTS time-error convergence.
+    """Create a 3D orbit-level waterfall plot of IS-DTS convergence.
 
     Parameters
     ----------
@@ -103,23 +193,30 @@ def plot_isdts_convergence(
         One-dimensional time axis in seconds.
     time_errors:
         Two-dimensional time synchronization error array in seconds with shape
-        ``(time, satellite_or_run)``.
+        ``(time, satellite)``.  Figure 6(a) is computed from this data as one
+        trace per orbit plane, referenced to the average of all satellites at
+        each time step.
     save_path:
         Optional destination. When supplied, the figure is written at 300 dpi.
     title:
         Figure title.
     satellite_stride:
-        Plot every Nth satellite/run to keep dense constellations readable.
+        Deprecated compatibility argument. Orbit-level Figure 6 plotting no
+        longer strides satellite traces because each line is an orbit.
+    orbit_indices:
+        Optional orbit-plane index for each satellite.  If omitted, satellites
+        are split into six equally sized orbit planes when possible.
     """
 
+    del satellite_stride  # Kept for backward-compatible callers.
     time_array = np.asarray(time, dtype=float)
     errors = _as_2d_time_satellite(time_errors, "time_errors")
 
     fig = plt.figure(figsize=(9, 6))
     ax = fig.add_subplot(111, projection="3d")
-    _plot_waterfall_lines(ax, time_array, errors, stride=satellite_stride)
+    _plot_orbit_waterfall_lines(ax, time_array, errors, orbit_indices)
     ax.set_title(title)
-    ax.legend(loc="upper right")
+    ax.legend(loc="upper right", fontsize=8)
     _save_figure(fig, save_path)
     return fig
 
@@ -134,56 +231,14 @@ def plot_satellite_accuracy_polar(
 ) -> plt.Figure:
     """Create a polar time-accuracy plot grouped by orbital plane.
 
-    Radial values are absolute final time differences/errors in seconds. Each
-    satellite is placed at an angular location according to its orbital plane
-    and in-plane index.
+    Radial values are absolute final time differences/errors in seconds. All
+    satellites in the same orbital plane share that orbit's polar angle.
     """
 
     errors = np.asarray(final_errors, dtype=float)
-    satellite_count = errors.size
-    if orbit_indices is None:
-        orbit_count = 6 if satellite_count % 6 == 0 else max(1, min(6, satellite_count))
-        orbit_indices_array = np.arange(satellite_count) % orbit_count
-    else:
-        orbit_indices_array = np.asarray(orbit_indices, dtype=int)
-        if orbit_indices_array.size != satellite_count:
-            raise ValueError("orbit_indices must have the same length as final_errors")
-        orbit_count = int(np.nanmax(orbit_indices_array)) + 1 if satellite_count else 0
-
-    failed = set(failed_satellites or [])
     fig = plt.figure(figsize=(7, 7))
     ax = fig.add_subplot(111, projection="polar")
-    colors, markers = _orbit_styles(orbit_count)
-    max_radius = float(np.nanmax(np.abs(errors))) if np.any(np.isfinite(errors)) else 1.0
-
-    for orbit in range(orbit_count):
-        indexes = np.where(orbit_indices_array == orbit)[0]
-        if indexes.size == 0:
-            continue
-        theta = 2.0 * np.pi * (orbit + (np.arange(indexes.size) + 0.5) / indexes.size) / orbit_count
-        radius = np.abs(errors[indexes])
-        ax.scatter(
-            theta,
-            radius,
-            color=colors[orbit],
-            marker=markers[orbit % len(markers)],
-            s=38,
-            alpha=0.9,
-            label=f"Orbit plane {orbit + 1}",
-        )
-        for angle, radial_value, sat_index in zip(theta, radius, indexes):
-            if sat_index in failed:
-                failed_radius = radial_value if np.isfinite(radial_value) else max_radius * 0.08
-                ax.scatter(angle, max(failed_radius, max_radius * 0.08), marker="x", s=95, color="red", linewidth=2.0)
-
-    if failed:
-        ax.scatter([], [], marker="x", s=95, color="red", linewidth=2.0, label="Failed satellite")
-    ax.set_title(title, pad=18)
-    ax.set_theta_zero_location("E")
-    ax.set_theta_direction(-1)
-    ax.set_rlabel_position(135)
-    ax.grid(True, alpha=0.35)
-    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.24), ncol=2, fontsize=8)
+    _draw_polar_on_axis(ax, errors, orbit_indices, title, failed_satellites)
     _save_figure(fig, save_path)
     return fig
 
@@ -200,8 +255,8 @@ def plot_isdts_results(
     errors = _as_2d_time_satellite(time_errors, "time_errors")
     fig = plt.figure(figsize=(13, 6))
     ax_3d = fig.add_subplot(121, projection="3d")
-    _plot_waterfall_lines(ax_3d, time_array, errors, stride=max(1, errors.shape[1] // 24))
-    ax_3d.set_title("(a) IS-DTS convergence")
+    _plot_orbit_waterfall_lines(ax_3d, time_array, errors, orbit_indices)
+    ax_3d.set_title("(a) Orbit convergence vs. 72-satellite average")
     ax_3d.legend(loc="upper right", fontsize=8)
 
     ax_polar = fig.add_subplot(122, projection="polar")
@@ -218,48 +273,71 @@ def _draw_polar_on_axis(
     title: str,
     failed_satellites: list[int] | tuple[int, ...] | None = None,
 ) -> None:
-    """Draw the polar accuracy graphic on a caller-provided axis."""
+    """Draw final satellite accuracy with one polar angle per orbit plane.
+
+    Figure 6(b) places all satellites from the same orbit on the same angular
+    spoke.  The radial coordinate is each satellite's absolute time accuracy
+    after convergence, so the 72 satellite accuracies are still visible while
+    the six angular positions identify the six orbit planes.
+    """
 
     errors = np.asarray(final_errors, dtype=float)
     satellite_count = errors.size
-    if orbit_indices is None:
-        orbit_count = 6 if satellite_count % 6 == 0 else max(1, min(6, satellite_count))
-        orbit_indices_array = np.arange(satellite_count) % orbit_count
-    else:
-        orbit_indices_array = np.asarray(orbit_indices, dtype=int)
-        orbit_count = int(np.nanmax(orbit_indices_array)) + 1 if satellite_count else 0
+    orbit_indices_array, orbit_count = _resolve_orbit_indices(satellite_count, orbit_indices)
     colors, markers = _orbit_styles(orbit_count)
     failed = set(failed_satellites or [])
     max_radius = float(np.nanmax(np.abs(errors))) if np.any(np.isfinite(errors)) else 1.0
+    orbit_angles = 2.0 * np.pi * np.arange(orbit_count) / max(orbit_count, 1)
 
     for orbit in range(orbit_count):
         indexes = np.where(orbit_indices_array == orbit)[0]
         if indexes.size == 0:
             continue
-        theta = 2.0 * np.pi * (orbit + (np.arange(indexes.size) + 0.5) / indexes.size) / orbit_count
+        theta = np.full(indexes.size, orbit_angles[orbit], dtype=float)
         radius = np.abs(errors[indexes])
         ax.scatter(
             theta,
             radius,
             color=colors[orbit],
             marker=markers[orbit % len(markers)],
-            s=32,
-            alpha=0.9,
+            s=36,
+            alpha=0.88,
             label=f"Orbit {orbit + 1}",
         )
-        for angle, radial_value, sat_index in zip(theta, radius, indexes):
+        finite_radius = radius[np.isfinite(radius)]
+        if finite_radius.size:
+            ax.scatter(
+                orbit_angles[orbit],
+                float(np.mean(finite_radius)),
+                color=colors[orbit],
+                edgecolor="black",
+                marker="D",
+                s=72,
+                linewidth=1.0,
+            )
+        for radial_value, sat_index in zip(radius, indexes):
             if sat_index in failed:
                 failed_radius = radial_value if np.isfinite(radial_value) else max_radius * 0.08
-                ax.scatter(angle, max(failed_radius, max_radius * 0.08), marker="x", s=90, color="red", linewidth=2.0)
+                ax.scatter(
+                    orbit_angles[orbit],
+                    max(failed_radius, max_radius * 0.08),
+                    marker="x",
+                    s=90,
+                    color="red",
+                    linewidth=2.0,
+                )
 
     if failed:
         ax.scatter([], [], marker="x", s=90, color="red", linewidth=2.0, label="Failed")
+    ax.scatter([], [], color="white", edgecolor="black", marker="D", s=72, linewidth=1.0, label="Orbit mean")
     ax.set_title(title, pad=16)
     ax.set_theta_zero_location("E")
     ax.set_theta_direction(-1)
+    ax.set_xticks(orbit_angles)
+    ax.set_xticklabels([f"Orbit {orbit + 1}" for orbit in range(orbit_count)])
     ax.set_rlabel_position(135)
     ax.grid(True, alpha=0.35)
-    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.25), ncol=2, fontsize=7)
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, -0.28), ncol=2, fontsize=7)
 
 
 def plot_peak_to_peak_difference(
@@ -272,7 +350,7 @@ def plot_peak_to_peak_difference(
     time_array = np.asarray(time, dtype=float)
     fig, ax = plt.subplots(figsize=(8, 5.5))
     for interval, values in sorted(diff_by_interval.items()):
-        diff = np.asarray(values, dtype=float)
+        diff = np.abs(np.asarray(values, dtype=float))
         ax.plot(time_array, np.maximum(diff, np.finfo(float).tiny), linewidth=1.8, label=f"interval = {interval:g} s")
     ax.set_yscale("log")
     ax.set_xlabel("Time [s]")
@@ -298,17 +376,22 @@ def plot_traditional_ptp_performance(
 
     fig, axes = plt.subplots(1, 2, figsize=(13, 5), sharex=True)
     for sat_index in range(same_orbit.shape[1]):
-        axes[0].plot(time_array, same_orbit[:, sat_index], linewidth=0.8, alpha=0.75)
+        axes[0].plot(time_array, np.abs(same_orbit[:, sat_index]), linewidth=0.8, alpha=0.75)
     axes[0].set_title("(a) Same orbital plane")
     axes[0].set_xlabel("Time [s]")
-    axes[0].set_ylabel("Time Difference [s]")
+    axes[0].set_ylabel("Absolute Time Difference [s]")
     axes[0].grid(True, alpha=0.3)
 
     for orbit_index in range(different_orbit.shape[1]):
-        axes[1].plot(time_array, different_orbit[:, orbit_index], linewidth=1.5, label=f"Orbit plane {orbit_index + 1}")
+        axes[1].plot(
+            time_array,
+            np.abs(different_orbit[:, orbit_index]),
+            linewidth=1.5,
+            label=f"Orbit plane {orbit_index + 1}",
+        )
     axes[1].set_title("(b) Different orbital planes")
     axes[1].set_xlabel("Time [s]")
-    axes[1].set_ylabel("Time Difference [s]")
+    axes[1].set_ylabel("Absolute Time Difference [s]")
     axes[1].grid(True, alpha=0.3)
     axes[1].legend(fontsize=8)
     fig.suptitle("Figure 8 — Traditional PTP performance")
