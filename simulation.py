@@ -286,6 +286,7 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
     if config.get("outputs", {}).get("save_plots", True):
         plots = importlib.import_module("plots")
         plots.create_run_plots(history, run_dir)
+        create_simulation_result_plots(history, config, run_dir)
 
     convergence_step = next(
         (
@@ -306,6 +307,133 @@ def run_single_simulation(config: dict[str, Any], run_dir: str | Path) -> dict[s
         json.dump(summary, file_obj, indent=2, sort_keys=True)
         file_obj.write("\n")
     return {"history": history, "summary": summary}
+
+
+
+
+
+def _orbit_indices(satellite_count: int, orbit_count: int = 6) -> np.ndarray:
+    """Assign simulated satellites to equally sized orbital planes for plotting."""
+
+    bounded_orbit_count = max(1, min(int(orbit_count), int(satellite_count)))
+    return np.repeat(
+        np.arange(bounded_orbit_count),
+        int(np.ceil(satellite_count / bounded_orbit_count)),
+    )[:satellite_count]
+
+
+def build_simulation_plot_data(history: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Build plotting arrays only from values produced by the simulation.
+
+    This intentionally avoids bootstrapping or synthesizing fixed reference data.
+    Optional PTP arrays are passed through only if a caller or future simulator
+    version stores real PTP outputs in ``history``.
+    """
+
+    sim = config["simulation"]
+    steps = np.asarray(history["step"], dtype=float)
+    time = steps * float(sim["time_step_s"])
+    offsets_s = np.asarray(history["clock_offsets_ns"], dtype=float) * 1e-9
+    satellite_count = offsets_s.shape[1]
+    orbit_count = int(sim.get("orbit_plane_count", 6))
+    orbit_indices = _orbit_indices(satellite_count, orbit_count)
+    peak_to_peak_s = np.asarray(history["peak_to_peak_error_ns"], dtype=float) * 1e-9
+
+    failed_satellites = sorted(
+        {
+            int(node_id)
+            for node_id in sim.get("faulty_nodes", [])
+        }
+        | {
+            int(event["node_id"])
+            for event in sim.get("failure_events", [])
+            if "node_id" in event
+        }
+    )
+
+    data: dict[str, Any] = {
+        "time": time,
+        "time_errors_s": offsets_s,
+        "orbit_indices": orbit_indices,
+        "peak_to_peak_by_interval": {float(sim["time_step_s"]): peak_to_peak_s},
+        "failed_satellites": failed_satellites,
+    }
+
+    if "traditional_ptp_same_orbit_s" in history and "traditional_ptp_different_orbit_s" in history:
+        data["same_orbit_ptp_s"] = np.asarray(history["traditional_ptp_same_orbit_s"], dtype=float)
+        data["different_orbit_ptp_s"] = np.asarray(history["traditional_ptp_different_orbit_s"], dtype=float)
+
+    return data
+
+
+def create_simulation_result_plots(
+    history: dict[str, Any],
+    config: dict[str, Any],
+    run_dir: str | Path,
+) -> list[Path]:
+    """Generate publication-style plots that are backed by simulation outputs."""
+
+    plots = importlib.import_module("plots")
+    plot_dir = Path(run_dir) / "results" / "plots"
+    plot_dir.mkdir(parents=True, exist_ok=True)
+    data = build_simulation_plot_data(history, config)
+
+    figure_specs = [
+        (
+            "fig6_isdts_results.png",
+            plots.plot_isdts_results(
+                data["time"],
+                data["time_errors_s"],
+                data["orbit_indices"],
+                save_path=plot_dir / "fig6_isdts_results.png",
+            ),
+        ),
+        (
+            "fig7_peak_to_peak_difference.png",
+            plots.plot_peak_to_peak_difference(
+                data["time"],
+                data["peak_to_peak_by_interval"],
+                save_path=plot_dir / "fig7_peak_to_peak_difference.png",
+            ),
+        ),
+    ]
+
+    if "same_orbit_ptp_s" in data and "different_orbit_ptp_s" in data:
+        figure_specs.append(
+            (
+                "fig8_traditional_ptp.png",
+                plots.plot_traditional_ptp_performance(
+                    data["time"],
+                    data["same_orbit_ptp_s"],
+                    data["different_orbit_ptp_s"],
+                    save_path=plot_dir / "fig8_traditional_ptp.png",
+                ),
+            )
+        )
+
+    if data["failed_satellites"]:
+        figure_specs.append(
+            (
+                "fig9_robustness.png",
+                plots.plot_robustness_results(
+                    data["time"],
+                    data["time_errors_s"],
+                    data["orbit_indices"],
+                    failed_satellites=data["failed_satellites"],
+                    save_path=plot_dir / "fig9_robustness.png",
+                ),
+            )
+        )
+
+    # Plotting functions return figures for reuse/display; close them here so
+    # batch simulation runs do not accumulate GUI resources.
+    import matplotlib.pyplot as plt
+
+    saved_paths: list[Path] = []
+    for filename, figure in figure_specs:
+        saved_paths.append(plot_dir / filename)
+        plt.close(figure)
+    return saved_paths
 
 
 def save_csv_outputs(history: dict[str, Any], run_dir: Path) -> None:
