@@ -95,7 +95,19 @@
           "high": 2e-06
         }
       }
-    }
+    },
+    "earth_radius_m": 6371000.0,
+    "earth_mu_m3_s2": 398600441800000.0,
+    "orbital_period_s": null,
+    "raan_spacing_deg": 60.0,
+    "true_anomaly_spacing_deg": 30.0,
+    "plane_phase_offset_deg": 0.0,
+    "ptp_master_node_id": 0,
+    "ptp_exchange_interval_s": 0.4,
+    "metrics_csv_name": "metrics.csv",
+    "offsets_csv_name": "clock_offsets.csv",
+    "links_csv_name": "link_measurements.csv",
+    "summary_json_name": "summary.json"
   },
   "laser": {
     "wavelength_m": 1.55e-06,
