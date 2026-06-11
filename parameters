@@ -1,8 +1,8 @@
 {
   "is_dts_simulation": {
-    "name": "isdts_laser_rf_demo",
+    "name": "satellite_multi_failure",
     "seed": 42,
-    "description": "Paper-aligned IS-DTS DES parameters for the LEO Walker constellation.",
+    "description": "Paper baseline: LEO Walker constellation, no artificial jitter/dropout/failures.",
     "satellite_count": 72,
     "orbital_planes": 6,
     "satellites_per_plane": 12,
@@ -11,8 +11,8 @@
     "polar_disconnect_latitude_deg": 66.5,
     "des_time_step_s": 0.02,
     "time_adjustment_interval_s": 0.4,
-    "duration_s": 200.0,
-    "convergence_threshold_ns": 2.5,
+    "duration_s": 500.0,
+    "convergence_threshold_ns": 100,
     "max_initial_time_offset_s": 1.0,
     "oscillator_frequency_accuracy": 1e-08,
     "timing_difference_sending_messages_s": 1e-06,
@@ -26,19 +26,37 @@
       0.8
     ],
     "failure_scenarios": [
-      {
+    {
         "orbital_plane": 3,
         "satellite_index": 1,
         "failure_start_s": 40,
         "failure_duration_s": 100
       },
       {
+        "orbital_plane": 1,
+        "satellite_index": 5,
+        "failure_start_s": 80,
+        "failure_duration_s": 140
+      },
+      {
+        "orbital_plane": 4,
+        "satellite_index": 3,
+        "failure_start_s": 120,
+        "failure_duration_s": 180
+      },
+      {
         "orbital_plane": 6,
-        "satellite_index": 12,
-        "failure_start_s": 90,
-        "failure_duration_s": 100
+        "satellite_index": 10,
+        "failure_start_s": 20,
+        "failure_duration_s": 80
+      },
+      {
+        "orbital_plane": 2,
+        "satellite_index": 11,
+        "failure_start_s": 100,
+        "failure_duration_s": 160
       }
-    ],
+      ],
     "expected_results": {
       "baseline_convergence_time_s": [
         120,
@@ -64,15 +82,15 @@
     "link_dropout_probability": 0.01,
     "link_geometry": {
       "base_range_m": 800000.0,
-      "range_jitter_m": 90000.0,
+      "range_jitter_m": 0.0,
       "elevation_deg": 60.0,
       "pointing_error_rad": 8e-07,
       "zenith_transmittance": 0.9,
-      "relative_velocity_std_m_per_s": 180.0
+      "relative_velocity_std_m_per_s": 0.0
     },
     "output_root": "outputs",
     "save_csv": true,
-    "save_plots": true,
+    "save_plots": false,
     "monte_carlo": {
       "enabled": false,
       "runs": 20,
@@ -104,9 +122,9 @@
     "plane_phase_offset_deg": 0.0,
     "ptp_master_node_id": 0,
     "ptp_exchange_interval_s": 0.4,
-    "metrics_csv_name": "metrics.csv",
-    "offsets_csv_name": "clock_offsets.csv",
-    "links_csv_name": "link_measurements.csv",
+    "metrics_csv_name": "metrics_satellite_failure.csv",
+    "offsets_csv_name": "clock_offsets_satellite_failure.csv",
+    "links_csv_name": "link_measurements_satellite_failure.csv",
     "summary_json_name": "summary.json"
   },
   "laser": {

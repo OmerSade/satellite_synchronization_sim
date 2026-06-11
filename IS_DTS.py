@@ -785,6 +785,10 @@ def run_simulation(config: dict[str, Any], parameter_path: Path, method: Literal
                 continue
             if method_name == "ptp" and method not in ("both", "ptp"):
                 continue
+
+            base_node_id = int(sync.get("ptp_master_node_id", 0))
+            base_clock_offset_ns = nodes[base_node_id].clock_offset_ns
+
             for node in nodes:
                 offset_rows.append(
                     {
@@ -795,6 +799,7 @@ def run_simulation(config: dict[str, Any], parameter_path: Path, method: Literal
                         "orbital_plane": node.orbital_plane,
                         "satellite_index": node.satellite_index,
                         "clock_offset_ns": node.clock_offset_ns,
+                        "offset_from_base_clock_ns": node.clock_offset_ns - base_clock_offset_ns,
                         "state": node.state.value,
                         "latitude_deg": node.latitude_deg,
                     }
@@ -906,7 +911,13 @@ def create_plots(history: dict[str, Any], output_dir: Path) -> list[Path]:
         if hasattr(plots, "create_run_plots"):
             generated.update(Path(path) for path in plots.create_run_plots(history, output_dir))
         if hasattr(plots, "plot_isdts_results"):
-            plots.plot_isdts_results(history["time_s"], np.asarray(history["isdts_clock_offsets_ns"]) / 1e9, orbit_indices=history.get("orbit_indices"), save_path=output_dir / "isdts_results.png")
+            plots.plot_isdts_results(
+                history["time_s"],
+                np.asarray(history["isdts_clock_offsets_ns"]) / 1e9,
+                orbit_indices=history.get("orbit_indices"),
+                save_path=output_dir / "isdts_results.png",
+                final_errors=np.asarray(history["isdts_offset_from_base_clock_ns"])[-1] / 1e9,
+            )
             generated.add(output_dir / "isdts_results.png")
         # plots.py exposes a paper Figure 8 helper with a richer signature; the
         # local fallback below always creates ptp_performance.png from this run.

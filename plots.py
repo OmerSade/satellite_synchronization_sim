@@ -248,6 +248,7 @@ def plot_isdts_results(
     time_errors: np.ndarray | list[list[float]],
     orbit_indices: np.ndarray | list[int] | None = None,
     save_path: str | Path | None = None,
+    final_errors: np.ndarray | list[float] | None = None,
 ) -> plt.Figure:
     """Create Figure 6-style IS-DTS convergence and final polar accuracy plots."""
 
@@ -260,7 +261,13 @@ def plot_isdts_results(
     ax_3d.legend(loc="upper right", fontsize=8)
 
     ax_polar = fig.add_subplot(122, projection="polar")
-    _draw_polar_on_axis(ax_polar, errors[-1], orbit_indices, "(b) Time accuracy after convergence")
+    polar_errors = errors[-1] if final_errors is None else np.asarray(final_errors, dtype=float)
+    _draw_polar_on_axis(
+        ax_polar,
+        polar_errors,
+        orbit_indices,
+        "(b) Time accuracy from base clock after convergence",
+    )
     fig.suptitle("Figure 6 — IS-DTS simulation results", y=0.98)
     _save_figure(fig, save_path)
     return fig
